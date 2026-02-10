@@ -23,7 +23,7 @@ describe('schema', () => {
 
   it('validates required meta fields', () => {
     const meta = {
-      schema_version: 1,
+      schema_version: 2,
       repository: 'owner/repo',
       workflow_name: 'CI',
       workflow_run_id: '1',

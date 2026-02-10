@@ -1,19 +1,19 @@
 name: privilege-escalation-bridge/emit
-description: Emit structured outputs and optional files as an artifact for privileged workflow_run consumption.
+description: Emit bridge outputs, metadata, optional event payload, and optional files for workflow_run consumers.
 author: leanprover-community
 inputs:
-  name:
+  artifact:
     description: Artifact name
     required: false
     default: bridge
   outputs:
-    description: JSON string of flat scalar outputs
+    description: JSON string of output object (merged over outputs_file when both are provided)
     required: false
   outputs_file:
-    description: Path to JSON file containing outputs
+    description: Path to JSON file containing output object
     required: false
   files:
-    description: Newline-separated file paths to include
+    description: Newline-separated relative file paths to include
     required: false
   retention_days:
     description: Artifact retention days
@@ -25,11 +25,20 @@ inputs:
   meta:
     description: Additional metadata as JSON object
     required: false
+  include_event:
+    description: Include triggering event payload in meta.event (none, minimal, full)
+    required: false
+    default: minimal
+  event_fields:
+    description: Optional comma/newline separated allowlist of event paths to include in meta.event (overrides include_event)
+    required: false
 outputs:
-  artifact-name:
+  artifact:
     description: Uploaded artifact name
   outputs-json:
-    description: Serialized emitted outputs
+    description: Serialized emitted outputs object
+  meta-json:
+    description: Serialized emitted metadata object
 runs:
-  using: node20
+  using: node24
   main: ../dist/emit/index.js

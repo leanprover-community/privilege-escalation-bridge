@@ -39232,7 +39232,7 @@ var adm_zip_default = /*#__PURE__*/__nccwpck_require__.n(adm_zip);
 ;// CONCATENATED MODULE: ./src/lib/schema.ts
 
 
-const schema_SCHEMA_VERSION = 1;
+const schema_SCHEMA_VERSION = 2;
 const OUTPUT_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 function schema_parseJsonObject(raw, label) {
     let parsed;
@@ -39297,6 +39297,11 @@ function validateMeta(meta) {
     }
     if (meta.pr_number !== undefined && typeof meta.pr_number !== 'number') {
         throw new Error('meta.pr_number must be a number when provided');
+    }
+    if (meta.event !== undefined) {
+        if (!meta.event || typeof meta.event !== 'object' || Array.isArray(meta.event)) {
+            throw new Error('meta.event must be an object when provided');
+        }
     }
 }
 function isScalar(value) {
@@ -39401,6 +39406,106 @@ function validateConsumerExpectations(meta, expectations) {
         throw new Error(`Source event ${meta.event_name} is not allowed`);
     }
 }
+function parseExtractMappings(raw) {
+    if (!raw.trim())
+        return [];
+    const lines = raw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    return lines.map((line) => {
+        const idx = line.indexOf('=');
+        if (idx <= 0 || idx === line.length - 1) {
+            throw new Error(`Invalid extract mapping '${line}'. Use 'output_name=source.path'`);
+        }
+        const name = line.slice(0, idx).trim();
+        const sourcePath = line.slice(idx + 1).trim();
+        if (!OUTPUT_KEY_RE.test(name)) {
+            throw new Error(`Invalid extract output key: ${name}`);
+        }
+        if (!sourcePath) {
+            throw new Error(`Invalid extract mapping '${line}': missing source path`);
+        }
+        return { name, path: sourcePath };
+    });
+}
+function parsePathList(raw) {
+    if (!raw.trim())
+        return [];
+    return raw
+        .split(/\r?\n|,/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+}
+function getByPath(value, pathSpec) {
+    if (pathSpec.includes('|')) {
+        const candidates = pathSpec
+            .split('|')
+            .map((part) => part.trim())
+            .filter(Boolean);
+        for (const candidate of candidates) {
+            const found = getByPath(value, candidate);
+            if (found !== undefined) {
+                return found;
+            }
+        }
+        return undefined;
+    }
+    const parts = pathSpec.split('.').map((part) => part.trim()).filter(Boolean);
+    if (parts.length === 0)
+        return undefined;
+    let current = value;
+    for (const part of parts) {
+        if (current === null || current === undefined)
+            return undefined;
+        if (Array.isArray(current)) {
+            const index = Number(part);
+            if (!Number.isInteger(index) || index < 0 || index >= current.length)
+                return undefined;
+            current = current[index];
+            continue;
+        }
+        if (typeof current !== 'object')
+            return undefined;
+        const objectValue = current;
+        if (!(part in objectValue))
+            return undefined;
+        current = objectValue[part];
+    }
+    if (current === null || ['string', 'number', 'boolean'].includes(typeof current)) {
+        return current;
+    }
+    return undefined;
+}
+function pickByPaths(value, paths) {
+    const out = {};
+    const setByPath = (target, pathSpec, scalar) => {
+        const parts = pathSpec.split('.').map((part) => part.trim()).filter(Boolean);
+        if (parts.length === 0)
+            return;
+        let cursor = target;
+        for (let idx = 0; idx < parts.length - 1; idx += 1) {
+            const part = parts[idx];
+            const current = cursor[part];
+            if (!current || typeof current !== 'object' || Array.isArray(current)) {
+                const next = {};
+                cursor[part] = next;
+                cursor = next;
+            }
+            else {
+                cursor = current;
+            }
+        }
+        cursor[parts[parts.length - 1]] = scalar;
+    };
+    for (const pathSpec of paths) {
+        const v = getByPath(value, pathSpec);
+        if (v !== undefined) {
+            setByPath(out, pathSpec, v);
+        }
+    }
+    return out;
+}
 
 ;// CONCATENATED MODULE: ./src/lib/logging.ts
 
@@ -39451,13 +39556,13 @@ function parseExposeMode() {
     }
     throw new Error(`Invalid expose mode: ${expose}`);
 }
-function parseRequiredEvents(input) {
-    if (!input.trim())
-        return [];
-    return input
-        .split(',')
-        .map((v) => v.trim())
-        .filter(Boolean);
+function writeMaybeOutput(name, value, expose) {
+    if (expose === 'outputs' || expose === 'both') {
+        setOutput(name, value);
+    }
+    if (expose === 'env' || expose === 'both') {
+        exportVariable(name, value);
+    }
 }
 async function downloadBridgeArtifact(logger, token, repository, runId, artifactName, failOnMissing) {
     const [owner, repo] = repository.split('/');
@@ -39504,7 +39609,7 @@ function validateExpectations(meta, runId) {
     const sourceWorkflow = getInput('source_workflow');
     const expectedHeadSha = getInput('expected_head_sha');
     const expectedPrNumber = getInput('expected_pr_number');
-    const requireEvent = parseRequiredEvents(getInput('require_event'));
+    const requireEvent = parsePathList(getInput('require_event'));
     const triggerAttempt = github_context.payload.workflow_run?.run_attempt;
     validateConsumerExpectations(meta, {
         repository: expectedRepository,
@@ -39516,13 +39621,30 @@ function validateExpectations(meta, runId) {
         requireEvents: requireEvent
     });
 }
+function emitExtractedValues(outputs, meta, expose) {
+    const extractRaw = getInput('extract');
+    if (!extractRaw.trim())
+        return [];
+    const mappings = parseExtractMappings(extractRaw);
+    const extractedKeys = [];
+    for (const mapping of mappings) {
+        const value = getByPath({ outputs, meta, event: meta.event || {} }, mapping.path);
+        if (value === undefined) {
+            continue;
+        }
+        const serialized = value === null ? 'null' : String(value);
+        writeMaybeOutput(mapping.name, serialized, expose);
+        extractedKeys.push(mapping.name);
+    }
+    return extractedKeys;
+}
 async function run() {
     const logger = logging_createLogger();
     const token = getInput('github_token') || process.env.GITHUB_TOKEN;
     if (!token) {
         throw new Error('GITHUB_TOKEN is required to download artifacts');
     }
-    const name = getInput('name') || 'bridge';
+    const artifactName = getInput('artifact') || 'bridge';
     const runId = Number(getInput('run_id') || github_context.payload.workflow_run?.id);
     const failOnMissing = getBooleanInput('fail_on_missing', { required: false });
     const expose = parseExposeMode();
@@ -39530,7 +39652,7 @@ async function run() {
     const destination = external_node_path_default().resolve(getInput('path') || '.bridge');
     const repository = process.env.GITHUB_REPOSITORY || `${github_context.repo.owner}/${github_context.repo.repo}`;
     await logger.withGroup('Bridge Consume: Inputs', () => {
-        logger.info(`Artifact name: ${name}`);
+        logger.info(`Artifact name: ${artifactName}`);
         logger.info(`Source run id: ${String(runId || '(unset)')}`);
         logger.info(`Expose mode: ${expose}`);
         logger.info(`Output prefix: ${prefix || '(none)'}`);
@@ -39542,15 +39664,18 @@ async function run() {
             logger.debug(`expected_head_sha: ${getInput('expected_head_sha') || '(none)'}`);
             logger.debug(`expected_pr_number: ${getInput('expected_pr_number') || '(none)'}`);
             logger.debug(`require_event: ${getInput('require_event') || '(none)'}`);
+            logger.debug(`extract mappings provided: ${getInput('extract') ? 'yes' : 'no'}`);
         }
     });
     if (!runId || Number.isNaN(runId)) {
         throw new Error('run_id is required (or action must run from workflow_run event)');
     }
-    const bridge = await logger.withGroup('Bridge Consume: Download Artifact', () => downloadBridgeArtifact(logger, token, repository, runId, name, failOnMissing));
+    const bridge = await logger.withGroup('Bridge Consume: Download Artifact', () => downloadBridgeArtifact(logger, token, repository, runId, artifactName, failOnMissing));
     if (!bridge) {
         info('Bridge artifact not found and fail_on_missing=false; exiting without outputs.');
-        setOutput('outputs', JSON.stringify({}));
+        setOutput('outputs-json', JSON.stringify({}));
+        setOutput('meta-json', JSON.stringify({}));
+        setOutput('event-json', JSON.stringify({}));
         return;
     }
     await logger.withGroup('Bridge Consume: Validate Metadata', () => {
@@ -39566,17 +39691,19 @@ async function run() {
         for (const [key, value] of Object.entries(bridge.outputs)) {
             const outKey = `${prefix}${key}`;
             const stringValue = value === null ? 'null' : String(value);
-            if (expose === 'outputs' || expose === 'both') {
-                setOutput(outKey, stringValue);
-            }
-            if (expose === 'env' || expose === 'both') {
-                exportVariable(outKey, stringValue);
-            }
+            writeMaybeOutput(outKey, stringValue, expose);
         }
-        logger.info(`Exposed ${Object.keys(bridge.outputs).length} output keys.`);
+        const extracted = emitExtractedValues(bridge.outputs, bridge.meta, expose);
+        logger.info(`Exposed ${Object.keys(bridge.outputs).length} bridge output keys.`);
+        if (extracted.length > 0) {
+            logger.info(`Exposed ${extracted.length} extracted keys from mappings.`);
+            debugJson(logger, 'extracted output keys', extracted);
+        }
         debugJson(logger, 'exposed output keys', Object.keys(bridge.outputs));
     });
-    setOutput('outputs', JSON.stringify(bridge.outputs));
+    setOutput('outputs-json', JSON.stringify(bridge.outputs));
+    setOutput('meta-json', JSON.stringify(bridge.meta));
+    setOutput('event-json', JSON.stringify(bridge.meta.event || {}));
     setOutput('files-path', destination);
     await (0,promises_namespaceObject.rm)(bridge.tempDir, { recursive: true, force: true });
     logger.info('Bridge consume completed.');

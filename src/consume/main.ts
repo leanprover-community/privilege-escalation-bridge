@@ -7,7 +7,13 @@ import { context, getOctokit } from '@actions/github';
 import AdmZip from 'adm-zip';
 
 import { ensureDir, type BridgeMeta, type OutputsMap } from '../lib/schema.js';
-import { readBridgeDirectory, validateConsumerExpectations } from '../lib/bridge.js';
+import {
+  getByPath,
+  parseExtractMappings,
+  parsePathList,
+  readBridgeDirectory,
+  validateConsumerExpectations
+} from '../lib/bridge.js';
 import { createLogger, debugJson, type Logger } from '../lib/logging.js';
 
 interface DownloadedBridge {
@@ -25,12 +31,13 @@ function parseExposeMode(): 'outputs' | 'env' | 'both' {
   throw new Error(`Invalid expose mode: ${expose}`);
 }
 
-function parseRequiredEvents(input: string): string[] {
-  if (!input.trim()) return [];
-  return input
-    .split(',')
-    .map((v) => v.trim())
-    .filter(Boolean);
+function writeMaybeOutput(name: string, value: string, expose: 'outputs' | 'env' | 'both'): void {
+  if (expose === 'outputs' || expose === 'both') {
+    core.setOutput(name, value);
+  }
+  if (expose === 'env' || expose === 'both') {
+    core.exportVariable(name, value);
+  }
 }
 
 async function downloadBridgeArtifact(
@@ -96,7 +103,7 @@ function validateExpectations(meta: BridgeMeta, runId: number): void {
   const sourceWorkflow = core.getInput('source_workflow');
   const expectedHeadSha = core.getInput('expected_head_sha');
   const expectedPrNumber = core.getInput('expected_pr_number');
-  const requireEvent = parseRequiredEvents(core.getInput('require_event'));
+  const requireEvent = parsePathList(core.getInput('require_event'));
   const triggerAttempt = context.payload.workflow_run?.run_attempt;
 
   validateConsumerExpectations(meta, {
@@ -110,6 +117,30 @@ function validateExpectations(meta: BridgeMeta, runId: number): void {
   });
 }
 
+function emitExtractedValues(
+  outputs: OutputsMap,
+  meta: BridgeMeta,
+  expose: 'outputs' | 'env' | 'both'
+): string[] {
+  const extractRaw = core.getInput('extract');
+  if (!extractRaw.trim()) return [];
+
+  const mappings = parseExtractMappings(extractRaw);
+  const extractedKeys: string[] = [];
+
+  for (const mapping of mappings) {
+    const value = getByPath({ outputs, meta, event: meta.event || {} }, mapping.path);
+    if (value === undefined) {
+      continue;
+    }
+    const serialized = value === null ? 'null' : String(value);
+    writeMaybeOutput(mapping.name, serialized, expose);
+    extractedKeys.push(mapping.name);
+  }
+
+  return extractedKeys;
+}
+
 async function run(): Promise<void> {
   const logger = createLogger();
   const token = core.getInput('github_token') || process.env.GITHUB_TOKEN;
@@ -117,7 +148,7 @@ async function run(): Promise<void> {
     throw new Error('GITHUB_TOKEN is required to download artifacts');
   }
 
-  const name = core.getInput('name') || 'bridge';
+  const artifactName = core.getInput('artifact') || 'bridge';
   const runId = Number(core.getInput('run_id') || context.payload.workflow_run?.id);
   const failOnMissing = core.getBooleanInput('fail_on_missing', { required: false });
   const expose = parseExposeMode();
@@ -126,7 +157,7 @@ async function run(): Promise<void> {
   const repository = process.env.GITHUB_REPOSITORY || `${context.repo.owner}/${context.repo.repo}`;
 
   await logger.withGroup('Bridge Consume: Inputs', () => {
-    logger.info(`Artifact name: ${name}`);
+    logger.info(`Artifact name: ${artifactName}`);
     logger.info(`Source run id: ${String(runId || '(unset)')}`);
     logger.info(`Expose mode: ${expose}`);
     logger.info(`Output prefix: ${prefix || '(none)'}`);
@@ -138,6 +169,7 @@ async function run(): Promise<void> {
       logger.debug(`expected_head_sha: ${core.getInput('expected_head_sha') || '(none)'}`);
       logger.debug(`expected_pr_number: ${core.getInput('expected_pr_number') || '(none)'}`);
       logger.debug(`require_event: ${core.getInput('require_event') || '(none)'}`);
+      logger.debug(`extract mappings provided: ${core.getInput('extract') ? 'yes' : 'no'}`);
     }
   });
 
@@ -146,11 +178,13 @@ async function run(): Promise<void> {
   }
 
   const bridge = await logger.withGroup('Bridge Consume: Download Artifact', () =>
-    downloadBridgeArtifact(logger, token, repository, runId, name, failOnMissing)
+    downloadBridgeArtifact(logger, token, repository, runId, artifactName, failOnMissing)
   );
   if (!bridge) {
     core.info('Bridge artifact not found and fail_on_missing=false; exiting without outputs.');
-    core.setOutput('outputs', JSON.stringify({}));
+    core.setOutput('outputs-json', JSON.stringify({}));
+    core.setOutput('meta-json', JSON.stringify({}));
+    core.setOutput('event-json', JSON.stringify({}));
     return;
   }
 
@@ -169,19 +203,22 @@ async function run(): Promise<void> {
     for (const [key, value] of Object.entries(bridge.outputs)) {
       const outKey = `${prefix}${key}`;
       const stringValue = value === null ? 'null' : String(value);
-
-      if (expose === 'outputs' || expose === 'both') {
-        core.setOutput(outKey, stringValue);
-      }
-      if (expose === 'env' || expose === 'both') {
-        core.exportVariable(outKey, stringValue);
-      }
+      writeMaybeOutput(outKey, stringValue, expose);
     }
-    logger.info(`Exposed ${Object.keys(bridge.outputs).length} output keys.`);
+
+    const extracted = emitExtractedValues(bridge.outputs, bridge.meta, expose);
+
+    logger.info(`Exposed ${Object.keys(bridge.outputs).length} bridge output keys.`);
+    if (extracted.length > 0) {
+      logger.info(`Exposed ${extracted.length} extracted keys from mappings.`);
+      debugJson(logger, 'extracted output keys', extracted);
+    }
     debugJson(logger, 'exposed output keys', Object.keys(bridge.outputs));
   });
 
-  core.setOutput('outputs', JSON.stringify(bridge.outputs));
+  core.setOutput('outputs-json', JSON.stringify(bridge.outputs));
+  core.setOutput('meta-json', JSON.stringify(bridge.meta));
+  core.setOutput('event-json', JSON.stringify(bridge.meta.event || {}));
   core.setOutput('files-path', destination);
 
   await rm(bridge.tempDir, { recursive: true, force: true });

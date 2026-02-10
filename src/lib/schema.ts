@@ -1,7 +1,7 @@
 import { mkdir, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const OUTPUT_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export type Scalar = string | number | boolean | null;
@@ -19,6 +19,7 @@ export interface BridgeMeta {
   pr_number?: number;
   producer_job?: string;
   producer_step?: string;
+  event?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -94,6 +95,12 @@ export function validateMeta(meta: Record<string, unknown>): asserts meta is Bri
 
   if (meta.pr_number !== undefined && typeof meta.pr_number !== 'number') {
     throw new Error('meta.pr_number must be a number when provided');
+  }
+
+  if (meta.event !== undefined) {
+    if (!meta.event || typeof meta.event !== 'object' || Array.isArray(meta.event)) {
+      throw new Error('meta.event must be an object when provided');
+    }
   }
 }
 

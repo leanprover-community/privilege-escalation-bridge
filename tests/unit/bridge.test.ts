@@ -5,6 +5,9 @@ import path from 'node:path';
 
 import {
   buildBridgeMeta,
+  getByPath,
+  parseExtractMappings,
+  pickByPaths,
   validateConsumerExpectations,
   writeBridgeDirectory
 } from '../../src/lib/bridge.js';
@@ -81,5 +84,25 @@ describe('bridge expectations', () => {
         [source]
       )
     ).rejects.toThrow(/relative paths/);
+  });
+
+  it('parses extract mappings', () => {
+    expect(parseExtractMappings('pr=meta.pr_number\nauthor=event.comment.user.login')).toEqual([
+      { name: 'pr', path: 'meta.pr_number' },
+      { name: 'author', path: 'event.comment.user.login' }
+    ]);
+  });
+
+  it('supports fallback paths and selected-event picks', () => {
+    const event = {
+      comment: { user: { login: 'alice' } },
+      pull_request: { number: 17 }
+    };
+    expect(getByPath({ event }, 'event.review.user.login|event.comment.user.login')).toBe('alice');
+
+    expect(pickByPaths(event, ['comment.user.login', 'pull_request.number'])).toEqual({
+      comment: { user: { login: 'alice' } },
+      pull_request: { number: 17 }
+    });
   });
 });

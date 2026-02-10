@@ -1,16 +1,16 @@
 name: privilege-escalation-bridge/consume
-description: Download and validate bridge artifact from workflow_run and expose outputs.
+description: Download, validate, and expose bridge artifact data from workflow_run.
 author: leanprover-community
 inputs:
   github_token:
     description: Token with actions:read for downloading artifacts
     required: false
-  name:
+  artifact:
     description: Artifact name
     required: false
     default: bridge
   run_id:
-    description: Source workflow run id (defaults to workflow_run.id)
+    description: Source workflow run id (defaults to triggering workflow_run.id)
     required: false
   source_workflow:
     description: Expected source workflow name
@@ -22,27 +22,34 @@ inputs:
     description: Expected source PR number
     required: false
   require_event:
-    description: Comma-separated list of allowed source events
+    description: Comma/newline-separated allowed source event names
     required: false
   fail_on_missing:
     description: Whether missing artifact fails the action
     required: false
     default: 'true'
   expose:
-    description: outputs, env, or both
+    description: outputs, env, or both (for per-key outputs and extract mappings)
     required: false
     default: outputs
   prefix:
-    description: Prefix for exposed output/env keys
+    description: Prefix for emitted per-key bridge outputs
     required: false
     default: ''
+  extract:
+    description: Newline-separated mappings like NAME=source.path, where source is outputs, meta, or event
+    required: false
   path:
-    description: Destination directory for restored files
+    description: Destination directory for restored bridge/files
     required: false
     default: .bridge
 outputs:
-  outputs:
-    description: JSON object of all outputs
+  outputs-json:
+    description: JSON object of bridge outputs
+  meta-json:
+    description: JSON object of bridge metadata
+  event-json:
+    description: JSON object for meta.event
   files-path:
     description: Directory where files were restored
 runs:

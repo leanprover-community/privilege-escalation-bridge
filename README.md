@@ -9,8 +9,8 @@ This repository provides two TypeScript-based JavaScript actions implementing a 
 
 | Action | Purpose |
 | --- | --- |
-| `privilege-escalation-bridge/emit` | Package flat scalar outputs + optional files into a stable artifact schema |
-| `privilege-escalation-bridge/consume` | Download and validate producer artifact from `workflow_run`, then re-expose outputs |
+| `privilege-escalation-bridge/emit` | Package outputs, metadata, optional selected event payload, and optional files into a stable artifact schema |
+| `privilege-escalation-bridge/consume` | Download and validate producer artifact from `workflow_run`, then expose outputs and extracted fields |
 
 ## Security Model
 
@@ -28,7 +28,7 @@ Non-goals:
 - Passing secrets through artifacts.
 - Preventing logical misuse of untrusted outputs by downstream steps.
 
-## Artifact Contract (Schema v1)
+## Artifact Contract (Schema v2)
 
 Artifact payload layout:
 
@@ -41,7 +41,7 @@ bridge/
 ```
 
 ### `outputs.json`
-- Flat object only.
+- JSON object.
 - Keys must match `^[A-Za-z_][A-Za-z0-9_]*$` in `strict` mode.
 - Values must be scalars (`string`, `number`, `boolean`, `null`) in `strict` mode.
 
@@ -60,6 +60,7 @@ Optional fields:
 - `pr_number`
 - `producer_job`
 - `producer_step`
+- `event` (payload subset or full event, depending on `emit` config)
 - Any user metadata provided through `emit.meta`
 
 ## `emit` Action
@@ -67,19 +68,20 @@ Optional fields:
 Path: `emit/action.yml`
 
 ### Inputs
-- `name` (default: `bridge`)
-- `outputs` JSON object string
+- `artifact` (default: `bridge`)
+- `outputs` JSON object string (merged over `outputs_file`)
 - `outputs_file` path to JSON object file
 - `files` newline-separated relative file paths
 - `retention_days`
 - `sanitize` (`strict` default, or `none`)
 - `meta` extra JSON object
-
-At least one of `outputs` or `outputs_file` is required.
+- `include_event` (`none`, `minimal`, `full`; default `minimal`)
+- `event_fields` optional comma/newline-separated allowlist of event paths (overrides `include_event`)
 
 ### Outputs
-- `artifact-name`
+- `artifact`
 - `outputs-json`
+- `meta-json`
 
 ## `consume` Action
 
@@ -87,20 +89,26 @@ Path: `consume/action.yml`
 
 ### Inputs
 - `github_token` (optional; defaults to `GITHUB_TOKEN` env)
-- `name` (default: `bridge`)
+- `artifact` (default: `bridge`)
 - `run_id` (defaults to triggering `workflow_run.id`)
 - `source_workflow`
 - `expected_head_sha`
 - `expected_pr_number`
-- `require_event` (comma-separated event names)
+- `require_event` (comma/newline-separated event names)
 - `fail_on_missing` (default: `true`)
 - `expose` (`outputs`, `env`, `both`; default `outputs`)
-- `prefix`
+- `prefix` prefix for per-key bridge outputs
+- `extract` newline-separated mappings: `NAME=source.path`
+  - Supported roots: `outputs`, `meta`, `event`
+  - Fallback paths: `a.b|c.d` (first found wins)
 - `path` restore destination for `bridge/files` (default `.bridge`)
 
 ### Outputs
-- Per-key outputs (subject to `expose`)
-- `outputs` (combined JSON)
+- Per-key outputs (subject to `expose` and `prefix`)
+- Extracted outputs from `extract` mappings
+- `outputs-json`
+- `meta-json`
+- `event-json`
 - `files-path`
 
 ## Logging
@@ -125,13 +133,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - run: echo '{"lint_ok":true,"report":"lint.json"}' > bridge.json
+      - run: echo '{"lint_ok":true}' > bridge.json
       - run: echo '{"ok":true}' > lint.json
 
       - uses: leanprover-community/privilege-escalation-bridge/emit@v1
         with:
-          name: pr-bridge
+          artifact: pr-bridge
           outputs_file: bridge.json
+          include_event: minimal
           files: |
             lint.json
 ```
@@ -156,12 +165,15 @@ jobs:
       - id: bridge
         uses: leanprover-community/privilege-escalation-bridge/consume@v1
         with:
-          name: pr-bridge
+          artifact: pr-bridge
           source_workflow: PR Checks
           expected_head_sha: ${{ github.event.workflow_run.head_sha }}
           require_event: pull_request
+          extract: |
+            pr_number=meta.pr_number
+            author=event.pull_request.user.login
 
-      - run: echo "lint_ok=${{ steps.bridge.outputs.lint_ok }}"
+      - run: echo "pr=${{ steps.bridge.outputs.pr_number }} author=${{ steps.bridge.outputs.author }}"
 ```
 
 ## Development
