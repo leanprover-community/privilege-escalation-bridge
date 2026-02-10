@@ -1,0 +1,50 @@
+name: privilege-escalation-bridge/consume
+description: Download and validate bridge artifact from workflow_run and expose outputs.
+author: leanprover-community
+inputs:
+  github_token:
+    description: Token with actions:read for downloading artifacts
+    required: false
+  name:
+    description: Artifact name
+    required: false
+    default: bridge
+  run_id:
+    description: Source workflow run id (defaults to workflow_run.id)
+    required: false
+  source_workflow:
+    description: Expected source workflow name
+    required: false
+  expected_head_sha:
+    description: Expected source head SHA
+    required: false
+  expected_pr_number:
+    description: Expected source PR number
+    required: false
+  require_event:
+    description: Comma-separated list of allowed source events
+    required: false
+  fail_on_missing:
+    description: Whether missing artifact fails the action
+    required: false
+    default: 'true'
+  expose:
+    description: outputs, env, or both
+    required: false
+    default: outputs
+  prefix:
+    description: Prefix for exposed output/env keys
+    required: false
+    default: ''
+  path:
+    description: Destination directory for restored files
+    required: false
+    default: .bridge
+outputs:
+  outputs:
+    description: JSON object of all outputs
+  files-path:
+    description: Directory where files were restored
+runs:
+  using: node24
+  main: ../dist/consume/index.js

@@ -1,0 +1,39 @@
+{
+  "name": "privilege-escalation-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Two-stage GitHub Actions bridge for unprivileged to privileged workflow handoff",
+  "license": "Apache-2.0",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && npm run build:emit && npm run build:consume",
+    "build:emit": "ncc build src/emit/main.ts -o dist/emit",
+    "build:consume": "ncc build src/consume/main.ts -o dist/consume",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests eslint.config.js vitest.config.ts",
+    "ci": "npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "dependencies": {
+    "@actions/artifact": "^6.1.0",
+    "@actions/core": "^3.0.0",
+    "@actions/github": "^9.0.0",
+    "adm-zip": "^0.5.16"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^25.2.2",
+    "@typescript-eslint/eslint-plugin": "^8.55.0",
+    "@typescript-eslint/parser": "^8.55.0",
+    "@vercel/ncc": "^0.38.4",
+    "eslint": "^9.39.2",
+    "eslint-config-prettier": "^10.1.8",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

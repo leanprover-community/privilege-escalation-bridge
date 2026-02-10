@@ -1,203 +1,118 @@
 # GitHub Actions Privilege Escalation Bridge
 
-This repository provides two GitHub Actions that together implement a **two-stage workflow pattern** for GitHub Actions.
+This repository provides two TypeScript-based JavaScript actions implementing a fork-safe two-stage GitHub Actions pattern:
 
-The goal is to allow workflows that run in **unprivileged contexts** (for example, `pull_request` workflows from forks with no secrets and read-only tokens) to produce structured “outputs” and files, and then allow a **privileged workflow** (triggered via `workflow_run`) to safely consume those outputs with full permissions.
+1. Unprivileged workflow (`pull_request`, `issue_comment`, `pull_request_review`, etc.) emits structured data as an artifact.
+2. Privileged workflow (`workflow_run`) consumes and validates that artifact before doing writes/secrets operations.
 
-## Background & Motivation
-
-GitHub Actions intentionally restricts:
-- Secrets
-- Write access
-- Elevated `GITHUB_TOKEN` permissions
-
-for workflows triggered by untrusted sources such as forked pull requests.
-
-A common, recommended pattern is to:
-1. Run untrusted code in a restricted workflow
-2. Package results as artifacts
-3. Trigger a second workflow via `workflow_run`
-4. Perform privileged actions using those results
-
-This repository abstracts the **artifact handling, validation, and output reconstruction** so that:
-- The pattern is easier to use correctly
-- Artifact formats are stable and versioned
-- Validation logic is centralized and reusable
-
-## High-Level Design
-
-There are two actions:
+## Actions
 
 | Action | Purpose |
-|------|--------|
-| `privilege-escalation-bridge/emit` | Runs in an unprivileged workflow and publishes structured outputs + optional files as an artifact |
-| `privilege-escalation-bridge/consume` | Runs in a privileged `workflow_run` workflow, validates the artifact, and exposes outputs like normal step outputs |
+| --- | --- |
+| `privilege-escalation-bridge/emit` | Package flat scalar outputs + optional files into a stable artifact schema |
+| `privilege-escalation-bridge/consume` | Download and validate producer artifact from `workflow_run`, then re-expose outputs |
 
-The artifact acts as a **trusted transport envelope**, but the contents themselves are always treated as **untrusted input** until validated.
+## Security Model
 
-## Security Model (Important)
+The bridge does not bypass GitHub's permissions model.
 
-This repository **does not** try to bypass GitHub’s security model.
+Defenses included:
+- Source run binding: `meta.workflow_run_id` must match expected run.
+- Run-attempt binding: `meta.workflow_run_attempt` must match expected attempt when available.
+- Repository binding: `meta.repository` must match current repository.
+- Optional pinning: workflow name, event type, PR number, and head SHA checks.
+- Fail-closed defaults for missing artifact and validation mismatches.
 
-Instead:
-- `privilege-escalation-bridge/emit` runs in a workflow with no secrets and no write access
-- `privilege-escalation-bridge/consume` runs only when GitHub emits a real `workflow_run` event
-- The consumer validates that the artifact came from the expected workflow run, repository, and commit
+Non-goals:
+- Trusting artifact contents as safe.
+- Passing secrets through artifacts.
+- Preventing logical misuse of untrusted outputs by downstream steps.
 
-Threats explicitly defended against:
-- Artifact substitution from a different run
-- Cross-PR or cross-SHA confusion
-- Replaying old artifacts
+## Artifact Contract (Schema v1)
 
-Threats explicitly **not** defended against:
-- Malicious or misleading artifact contents
-- Data poisoning (outputs must be treated as untrusted input)
-- Secret transport (these actions must never be used to pass secrets)
+Artifact payload layout:
 
-## Artifact Format (Contract)
-
-Artifacts produced by `privilege-escalation-bridge/emit` have a **stable, versioned structure**:
-
-```
+```text
 bridge/
-outputs.json
-meta.json
-files/
-...optional copied files...
-
-````
+  outputs.json
+  meta.json
+  files/
+    ...optional copied files
+```
 
 ### `outputs.json`
-
-A flat JSON object of key/value pairs.
-
-Rules:
-- Keys must match: `^[A-Za-z_][A-Za-z0-9_]*$`
-- Values must be JSON scalars (string, number, boolean, null)
-- Nested objects and arrays are not allowed
-- Intended to map cleanly to GitHub step outputs (strings)
-
-Example:
-```json
-{
-  "lint_ok": true,
-  "report_path": "reports/lint.json"
-}
-````
+- Flat object only.
+- Keys must match `^[A-Za-z_][A-Za-z0-9_]*$` in `strict` mode.
+- Values must be scalars (`string`, `number`, `boolean`, `null`) in `strict` mode.
 
 ### `meta.json`
-
-Metadata used for validation and auditing.
-
 Required fields:
-
-* `schema_version`
-* `repository`
-* `workflow_name`
-* `workflow_run_id`
-* `event_name`
-* `head_sha`
-* `created_at`
+- `schema_version`
+- `repository`
+- `workflow_name`
+- `workflow_run_id`
+- `workflow_run_attempt`
+- `event_name`
+- `head_sha`
+- `created_at`
 
 Optional fields:
+- `pr_number`
+- `producer_job`
+- `producer_step`
+- Any user metadata provided through `emit.meta`
 
-* `pr_number`
-* `producer_job`
-* `producer_step`
-* arbitrary user-supplied metadata
+## `emit` Action
 
-## Action: `privilege-escalation-bridge/emit`
-
-### Purpose
-
-Publish structured outputs and optional files from an unprivileged workflow.
-
-### Intended Usage
-
-* `pull_request`
-* `issue_comment`
-* `pull_request_review`
-* Any context without secrets or write access
+Path: `emit/action.yml`
 
 ### Inputs
+- `name` (default: `bridge`)
+- `outputs` JSON object string
+- `outputs_file` path to JSON object file
+- `files` newline-separated relative file paths
+- `retention_days`
+- `sanitize` (`strict` default, or `none`)
+- `meta` extra JSON object
 
-| Name             | Required | Description                                   |
-| ---------------- | -------- | --------------------------------------------- |
-| `name`           | no       | Artifact name (default: `bridge`)             |
-| `outputs`        | no       | JSON string of outputs                        |
-| `outputs_file`   | no       | Path to a JSON file containing outputs        |
-| `files`          | no       | Newline-separated list of file paths or globs |
-| `retention_days` | no       | Artifact retention period                     |
-| `sanitize`       | no       | `strict` (default) or `none`                  |
-| `meta`           | no       | Additional metadata (JSON)                    |
-
-At least one of `outputs` or `outputs_file` must be provided.
-
-### Behavior
-
-* Validates output keys and values (unless `sanitize=none`)
-* Writes `outputs.json` and `meta.json`
-* Copies requested files into `privilege-escalation-bridge/files/`
-* Uploads the artifact using `actions/upload-artifact`
+At least one of `outputs` or `outputs_file` is required.
 
 ### Outputs
+- `artifact-name`
+- `outputs-json`
 
-| Name            | Description                    |
-| --------------- | ------------------------------ |
-| `artifact-name` | Name of the uploaded artifact  |
-| `outputs-json`  | JSON string of emitted outputs |
+## `consume` Action
 
-## Action: `privilege-escalation-bridge/consume`
-
-### Purpose
-
-Download, validate, and expose outputs from a previous workflow run.
-
-### Intended Usage
-
-* `workflow_run` workflows only
-* Must run on the default branch
+Path: `consume/action.yml`
 
 ### Inputs
-
-| Name                 | Required | Description                                             |
-| -------------------- | -------- | ------------------------------------------------------- |
-| `name`               | no       | Artifact name (default: `bridge`)                       |
-| `run_id`             | no       | Workflow run ID (default: triggering `workflow_run.id`) |
-| `source_workflow`    | no       | Expected source workflow name                           |
-| `expected_head_sha`  | no       | Expected commit SHA                                     |
-| `expected_pr_number` | no       | Expected PR number                                      |
-| `require_event`      | no       | Allowed source event names                              |
-| `fail_on_missing`    | no       | Default `true`                                          |
-| `expose`             | no       | `outputs`, `env`, or `both`                             |
-| `prefix`             | no       | Prefix for exposed outputs                              |
-| `path`               | no       | Directory to extract files into (default: `.bridge`)    |
-
-### Behavior
-
-* Downloads artifact from the specified workflow run
-* Validates metadata against expectations
-* Fails closed by default if validation fails
-* Writes outputs to `$GITHUB_OUTPUT`
-* Optionally exposes outputs as environment variables
-* Restores files for downstream steps
+- `github_token` (optional; defaults to `GITHUB_TOKEN` env)
+- `name` (default: `bridge`)
+- `run_id` (defaults to triggering `workflow_run.id`)
+- `source_workflow`
+- `expected_head_sha`
+- `expected_pr_number`
+- `require_event` (comma-separated event names)
+- `fail_on_missing` (default: `true`)
+- `expose` (`outputs`, `env`, `both`; default `outputs`)
+- `prefix`
+- `path` restore destination for `bridge/files` (default `.bridge`)
 
 ### Outputs
+- Per-key outputs (subject to `expose`)
+- `outputs` (combined JSON)
+- `files-path`
 
-* Individual outputs by key:
+## Logging
 
-  ```yaml
-  steps.bridge.outputs.lint_ok
-  ```
-* A combined JSON output:
+Both actions use collapsible log groups in the Actions UI for major phases.
 
-  ```yaml
-  steps.bridge.outputs.outputs
-  ```
+- Standard runs show concise `core.info` summaries.
+- Detailed internals are emitted via `core.debug` and appear when step debug logging is enabled (`ACTIONS_STEP_DEBUG=true`).
 
-## Example: End-to-End Usage
+## Quick Example
 
-### Unprivileged Workflow
+### Unprivileged Producer
 
 ```yaml
 on: pull_request
@@ -205,24 +120,23 @@ on: pull_request
 jobs:
   checks:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
-      - run: ./ci/lint --json > reports/lint.json
+      - run: echo '{"lint_ok":true,"report":"lint.json"}' > bridge.json
+      - run: echo '{"ok":true}' > lint.json
 
       - uses: leanprover-community/privilege-escalation-bridge/emit@v1
         with:
           name: pr-bridge
-          outputs: |
-            {
-              "lint_ok": true,
-              "lint_report": "reports/lint.json"
-            }
+          outputs_file: bridge.json
           files: |
-            reports/lint.json
+            lint.json
 ```
 
-### Privileged Workflow
+### Privileged Consumer
 
 ```yaml
 on:
@@ -232,40 +146,53 @@ on:
 
 jobs:
   consume:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
     steps:
       - id: bridge
         uses: leanprover-community/privilege-escalation-bridge/consume@v1
         with:
           name: pr-bridge
+          source_workflow: PR Checks
           expected_head_sha: ${{ github.event.workflow_run.head_sha }}
+          require_event: pull_request
 
-      - run: |
-          echo "Lint OK? ${{ steps.bridge.outputs.lint_ok }}"
-          cat "${{ steps.bridge.outputs.lint_report }}"
+      - run: echo "lint_ok=${{ steps.bridge.outputs.lint_ok }}"
 ```
 
-## Design Principles
+## Development
 
-* **Fail closed**: validation errors stop the workflow
-* **Treat artifacts as untrusted input**
-* **Stable artifact format**
-* **Explicit validation beats implicit trust**
-* **Ergonomic replacement for step outputs**
+### Install
 
-## Non-Goals
+```bash
+npm ci
+```
 
-* Transporting secrets
-* Trusting fork-provided data
-* Replacing GitHub’s permission model
-* Providing general artifact management utilities
+### Test
 
-## Versioning & Compatibility
+```bash
+npm test
+```
 
-* Artifact schema is versioned
-* Backwards compatibility is maintained within a major version
-* Breaking changes require a major version bump
+### Build
+
+```bash
+npm run build
+```
+
+## CI
+
+CI workflow runs on pull requests and main/master pushes:
+- `npm ci`
+- `npm run lint`
+- `npm run typecheck`
+- `npm test`
+- `npm run build`
 
 ## License
 
-Apache-2.0 License
+Apache-2.0
