@@ -32194,6 +32194,11 @@ __webpack_unused_export__ = defaultContentType
 /************************************************************************/
 var __webpack_exports__ = {};
 
+// EXPORTS
+__nccwpck_require__.d(__webpack_exports__, {
+  e: () => (/* binding */ run)
+});
+
 ;// CONCATENATED MODULE: external "node:fs/promises"
 const promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs/promises");
 ;// CONCATENATED MODULE: external "node:os"
@@ -39741,8 +39746,12 @@ async function run() {
     await (0,promises_namespaceObject.rm)(bridge.tempDir, { recursive: true, force: true });
     logger.info('Bridge consume completed.');
 }
-run().catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    setFailed(message);
-});
+if (!process.env.VITEST) {
+    run().catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setFailed(message);
+    });
+}
 
+var __webpack_exports__run = __webpack_exports__.e;
+export { __webpack_exports__run as run };

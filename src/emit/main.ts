@@ -66,7 +66,7 @@ function buildEventMeta(mode: 'none' | 'minimal' | 'full', eventFieldsRaw: strin
   return pickByPaths(context.payload, MINIMAL_EVENT_PATHS);
 }
 
-async function run(): Promise<void> {
+export async function run(): Promise<void> {
   const logger = createLogger();
   const artifactName = core.getInput('artifact') || 'bridge';
   const outputsRaw = core.getInput('outputs');
@@ -158,7 +158,9 @@ async function run(): Promise<void> {
   logger.info(`Bridge emit completed for artifact '${artifactName}'.`);
 }
 
-run().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  core.setFailed(message);
-});
+if (!process.env.VITEST) {
+  run().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    core.setFailed(message);
+  });
+}

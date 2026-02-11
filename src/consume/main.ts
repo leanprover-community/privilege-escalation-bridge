@@ -143,7 +143,7 @@ function emitExtractedValues(
   return extractedKeys;
 }
 
-async function run(): Promise<void> {
+export async function run(): Promise<void> {
   const logger = createLogger();
   const token = resolveAuthToken({
     tokenInput: core.getInput('token'),
@@ -232,7 +232,9 @@ async function run(): Promise<void> {
   logger.info('Bridge consume completed.');
 }
 
-run().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  core.setFailed(message);
-});
+if (!process.env.VITEST) {
+  run().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    core.setFailed(message);
+  });
+}

@@ -34,4 +34,78 @@ describe('schema', () => {
     };
     expect(() => validateMeta(meta)).not.toThrow();
   });
+
+  it('rejects unsupported schema version', () => {
+    expect(() =>
+      validateMeta({
+        schema_version: 999,
+        repository: 'owner/repo',
+        workflow_name: 'CI',
+        workflow_run_id: '1',
+        workflow_run_attempt: '1',
+        event_name: 'pull_request',
+        head_sha: 'abc',
+        created_at: new Date().toISOString()
+      })
+    ).toThrow(/Unsupported schema_version/);
+  });
+
+  it('rejects missing required meta fields', () => {
+    expect(() =>
+      validateMeta({
+        schema_version: 2,
+        repository: 'owner/repo',
+        workflow_name: 'CI',
+        workflow_run_id: '1',
+        workflow_run_attempt: '1',
+        event_name: 'pull_request',
+        head_sha: 'abc'
+      })
+    ).toThrow(/Missing required meta field: created_at/);
+  });
+
+  it('rejects empty required string meta fields', () => {
+    expect(() =>
+      validateMeta({
+        schema_version: 2,
+        repository: '',
+        workflow_name: 'CI',
+        workflow_run_id: '1',
+        workflow_run_attempt: '1',
+        event_name: 'pull_request',
+        head_sha: 'abc',
+        created_at: new Date().toISOString()
+      })
+    ).toThrow(/Invalid meta field: repository/);
+  });
+
+  it('rejects invalid optional meta field types', () => {
+    expect(() =>
+      validateMeta({
+        schema_version: 2,
+        repository: 'owner/repo',
+        workflow_name: 'CI',
+        workflow_run_id: '1',
+        workflow_run_attempt: '1',
+        event_name: 'pull_request',
+        head_sha: 'abc',
+        created_at: new Date().toISOString(),
+        pr_number: '12'
+      })
+    ).toThrow(/meta.pr_number must be a number/);
+
+    expect(() =>
+      validateMeta({
+        schema_version: 2,
+        repository: 'owner/repo',
+        workflow_name: 'CI',
+        workflow_run_id: '1',
+        workflow_run_attempt: '1',
+        event_name: 'pull_request',
+        head_sha: 'abc',
+        created_at: new Date().toISOString(),
+        event: []
+      })
+    ).toThrow(/meta.event must be an object/);
+  });
 });
