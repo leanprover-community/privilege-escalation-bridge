@@ -15,6 +15,7 @@ import {
   validateConsumerExpectations
 } from '../lib/bridge.js';
 import { createLogger, debugJson, type Logger } from '../lib/logging.js';
+import { resolveAuthToken } from './token.js';
 
 interface DownloadedBridge {
   meta: BridgeMeta;
@@ -143,10 +144,12 @@ function emitExtractedValues(
 
 async function run(): Promise<void> {
   const logger = createLogger();
-  const token = core.getInput('github_token') || process.env.GITHUB_TOKEN;
-  if (!token) {
-    throw new Error('GITHUB_TOKEN is required to download artifacts');
-  }
+  const token = resolveAuthToken({
+    tokenInput: core.getInput('token'),
+    githubTokenInput: core.getInput('github_token'),
+    envGithubToken: process.env.GITHUB_TOKEN,
+    envGhToken: process.env.GH_TOKEN
+  });
 
   const artifactName = core.getInput('artifact') || 'bridge';
   const runId = Number(core.getInput('run_id') || context.payload.workflow_run?.id);

@@ -39539,7 +39539,18 @@ function debugJson(logger, label, value) {
     logger.debug(`${label}: ${JSON.stringify(value, null, 2)}`);
 }
 
+;// CONCATENATED MODULE: ./src/consume/token.ts
+function resolveAuthToken(sources) {
+    const token = sources.tokenInput || sources.githubTokenInput || sources.envGithubToken || sources.envGhToken;
+    if (token) {
+        return token;
+    }
+    throw new Error('Missing token for artifact download. Checked (in order): input "token", input "github_token", env "GITHUB_TOKEN", env "GH_TOKEN". ' +
+        'Provide `with: token: ${{ github.token }}` (or equivalent token with actions:read).');
+}
+
 ;// CONCATENATED MODULE: ./src/consume/main.ts
+
 
 
 
@@ -39640,10 +39651,12 @@ function emitExtractedValues(outputs, meta, expose) {
 }
 async function run() {
     const logger = logging_createLogger();
-    const token = getInput('github_token') || process.env.GITHUB_TOKEN;
-    if (!token) {
-        throw new Error('GITHUB_TOKEN is required to download artifacts');
-    }
+    const token = resolveAuthToken({
+        tokenInput: getInput('token'),
+        githubTokenInput: getInput('github_token'),
+        envGithubToken: process.env.GITHUB_TOKEN,
+        envGhToken: process.env.GH_TOKEN
+    });
     const artifactName = getInput('artifact') || 'bridge';
     const runId = Number(getInput('run_id') || github_context.payload.workflow_run?.id);
     const failOnMissing = getBooleanInput('fail_on_missing', { required: false });

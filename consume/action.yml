@@ -2,8 +2,11 @@ name: privilege-escalation-bridge/consume
 description: Download, validate, and expose bridge artifact data from workflow_run.
 author: leanprover-community
 inputs:
+  token:
+    description: Token with actions:read for downloading artifacts (recommended)
+    required: false
   github_token:
-    description: Token with actions:read for downloading artifacts
+    description: Deprecated alias for token. Token with actions:read for downloading artifacts
     required: false
   artifact:
     description: Artifact name

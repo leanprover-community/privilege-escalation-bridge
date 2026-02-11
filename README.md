@@ -144,7 +144,13 @@ Path: `emit/action.yml`
 Path: `consume/action.yml`
 
 ### Inputs
-- `github_token` (optional; defaults to `GITHUB_TOKEN` env)
+- `token` (recommended)
+  - Token with `actions:read` for downloading artifacts.
+  - In reusable workflows, pass explicitly: `token: ${{ github.token }}`.
+- `github_token` (deprecated alias for `token`)
+  - Supported for backward compatibility.
+- Env fallback
+  - If neither input is set, `consume` checks `GITHUB_TOKEN` then `GH_TOKEN`.
   - Must allow `actions:read` in the target repository.
 - `artifact` (default: `bridge`)
   - Artifact name to download from the producer run.
@@ -253,6 +259,7 @@ jobs:
       - id: bridge
         uses: leanprover-community/privilege-escalation-bridge/consume@v1
         with:
+          token: ${{ github.token }}
           artifact: pr-bridge
           source_workflow: PR Checks
           expected_head_sha: ${{ github.event.workflow_run.head_sha }}
