@@ -39381,6 +39381,23 @@ async function readBridgeDirectory(rootDir) {
         filesDir: external_node_path_default().join(bridgeDir, 'files')
     };
 }
+async function restoreBridgeFiles(filesDir, destination) {
+    try {
+        const sourceStat = await (0,promises_namespaceObject.stat)(filesDir);
+        if (!sourceStat.isDirectory()) {
+            return false;
+        }
+    }
+    catch (error) {
+        if (error.code === 'ENOENT') {
+            return false;
+        }
+        throw error;
+    }
+    await schema_ensureDir(destination);
+    await (0,promises_namespaceObject.cp)(filesDir, destination, { recursive: true, force: true });
+    return true;
+}
 function validateConsumerExpectations(meta, expectations) {
     if (meta.repository !== expectations.repository) {
         throw new Error(`Repository mismatch: expected ${expectations.repository}, got ${meta.repository}`);
@@ -39559,7 +39576,6 @@ function resolveAuthToken(sources) {
 
 
 
-
 function parseExposeMode() {
     const expose = (getInput('expose') || 'outputs').trim();
     if (expose === 'outputs' || expose === 'env' || expose === 'both') {
@@ -39696,9 +39712,13 @@ async function run() {
         logger.info('Metadata validation passed.');
     });
     await logger.withGroup('Bridge Consume: Restore Files', async () => {
-        await schema_ensureDir(destination);
-        await (0,promises_namespaceObject.cp)(bridge.filesDir, destination, { recursive: true, force: true });
-        logger.info(`Restored files to ${destination}`);
+        const restored = await restoreBridgeFiles(bridge.filesDir, destination);
+        if (restored) {
+            logger.info(`Restored files to ${destination}`);
+        }
+        else {
+            logger.info("No 'bridge/files' directory in artifact; skipping file restore.");
+        }
     });
     await logger.withGroup('Bridge Consume: Expose Outputs', () => {
         for (const [key, value] of Object.entries(bridge.outputs)) {

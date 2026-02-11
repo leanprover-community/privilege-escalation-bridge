@@ -1,4 +1,4 @@
-import { cp, mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -6,12 +6,13 @@ import * as core from '@actions/core';
 import { context, getOctokit } from '@actions/github';
 import AdmZip from 'adm-zip';
 
-import { ensureDir, type BridgeMeta, type OutputsMap } from '../lib/schema.js';
+import { type BridgeMeta, type OutputsMap } from '../lib/schema.js';
 import {
   getByPath,
   parseExtractMappings,
   parsePathList,
   readBridgeDirectory,
+  restoreBridgeFiles,
   validateConsumerExpectations
 } from '../lib/bridge.js';
 import { createLogger, debugJson, type Logger } from '../lib/logging.js';
@@ -197,9 +198,12 @@ async function run(): Promise<void> {
   });
 
   await logger.withGroup('Bridge Consume: Restore Files', async () => {
-    await ensureDir(destination);
-    await cp(bridge.filesDir, destination, { recursive: true, force: true });
-    logger.info(`Restored files to ${destination}`);
+    const restored = await restoreBridgeFiles(bridge.filesDir, destination);
+    if (restored) {
+      logger.info(`Restored files to ${destination}`);
+    } else {
+      logger.info("No 'bridge/files' directory in artifact; skipping file restore.");
+    }
   });
 
   await logger.withGroup('Bridge Consume: Expose Outputs', () => {

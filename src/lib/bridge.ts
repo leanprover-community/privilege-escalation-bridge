@@ -1,4 +1,4 @@
-import { cp, readFile, writeFile } from 'node:fs/promises';
+import { cp, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
@@ -114,6 +114,24 @@ export async function readBridgeDirectory(rootDir: string): Promise<{
     meta,
     filesDir: path.join(bridgeDir, 'files')
   };
+}
+
+export async function restoreBridgeFiles(filesDir: string, destination: string): Promise<boolean> {
+  try {
+    const sourceStat = await stat(filesDir);
+    if (!sourceStat.isDirectory()) {
+      return false;
+    }
+  } catch (error: unknown) {
+    if ((error as { code?: string }).code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+
+  await ensureDir(destination);
+  await cp(filesDir, destination, { recursive: true, force: true });
+  return true;
 }
 
 export function validateConsumerExpectations(
