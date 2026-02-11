@@ -1,0 +1,209 @@
+name: Create single-file PR from review comment (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      base_ref:
+        description: 'Base branch to compare against (optional)'
+        required: false
+        type: string
+        default: master
+      committer:
+        description: >
+          The committer name and email address in the format `Display Name <email@address.com>`.
+          Defaults to the GitHub Actions bot user.
+        required: false
+        type: string
+        default: 'github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>'
+      author:
+        description: >
+          The author name and email address in the format `Display Name <email@address.com>`.
+          Defaults to the author of the PR.
+        required: false
+        type: string
+        default: '${{ github.event.pull_request.user.login }} <${{ github.event.pull_request.user.id }}+${{ github.event.pull_request.user.login }}@users.noreply.github.com>'
+    secrets:
+      token:
+        description: 'Token used to checkout the repo (change from GITHUB_TOKEN to allow triggering CI)'
+        required: false
+
+permissions:
+  contents: write         # needed to push a branch
+  pull-requests: write    # needed to open a PR
+
+jobs:
+  create-single-file-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify caller event is pull_request_review_comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eventName = context.eventName;
+            const hasReviewCommentPayload = !!(context.payload?.comment && context.payload?.pull_request);
+
+            if (eventName !== "pull_request_review_comment" && !hasReviewCommentPayload) {
+              core.setFailed(
+                `This workflow must be called from a pull_request_review_comment trigger; got ${eventName}.`
+              );
+              return;
+            }
+
+            core.info(`Trigger OK: ${eventName}`);
+
+      - name: Extract essentials from event (and optionally filter for suggestions)
+        id: extract
+        uses: actions/github-script@v7
+        env:
+          # Pass the reusable input down to the script and emit it as an output named base_ref
+          BASE_REF_INPUT: ${{ inputs.base_ref }}
+        with:
+          script: |
+            // NOTE: In actions/github-script, `core`, `github`, and `context` are provided globally.
+            const comment = context.payload?.comment;
+            const pr = context.payload?.pull_request;
+            const body = comment?.body || "";
+
+            core.info(`Comment body:\n---\n${body}\n---`);
+
+            // Start-of-line match across lines; no leading whitespace allowed
+            if (!/^splice-bot\b/im.test(body)) {
+              core.info("No `splice-bot` found at the start of a line, skipping.");
+              core.setOutput("skip", "true");
+              return;
+            }
+
+            const path = comment?.path;
+            if (!path) {
+              core.info("This review comment is not on a file diff (no .path). Nothing to do.");
+              core.setOutput("skip", "true");
+              return;
+            }
+
+            if (!pr) {
+              core.info("No pull_request object on this event.");
+              core.setOutput("skip", "true");
+              return;
+            }
+
+            // Gather PR metadata (for logging and outputs)
+            const prNumber = pr.number;
+            const baseSha = pr.base?.sha;
+            const baseRepoFullName = pr.base?.repo?.full_name;
+            const headSha = pr.head?.sha;
+            const headRepoFullName = pr.head?.repo?.full_name;
+
+            if (!baseSha || !headSha || !baseRepoFullName || !headRepoFullName) {
+              core.info("Missing required PR details (base/head sha/repo).");
+              core.setOutput("skip", "true");
+              return;
+            }
+
+            const filename = path.split("/").pop();
+            const baseRefFromInput = process.env.BASE_REF_INPUT || "master";
+
+            core.info(`File path: ${path}`);
+            core.info(`Filename: ${filename}`);
+            core.info(`PR #${prNumber} | base: ${baseRefFromInput} | head sha: ${headSha}`);
+            core.info(`head repo: ${headRepoFullName} | base repo: ${baseRepoFullName}`);
+
+            // Outputs preserved for downstream steps
+            core.setOutput("skip", "false");
+            core.setOutput("file_path", path);
+            core.setOutput("pr_number", String(prNumber));
+            // IMPORTANT: base_ref now comes from the reusable workflow input (default master)
+            core.setOutput("base_ref", baseRefFromInput);
+            core.setOutput("base_repo", baseRepoFullName);
+            core.setOutput("head_repo", headRepoFullName);
+
+      - name: Check out BASE (PR base repo @ base_ref)
+        if: steps.extract.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.repo_token || github.token }}
+          repository: ${{ steps.extract.outputs.base_repo }}
+          ref: ${{ steps.extract.outputs.base_ref }}
+          fetch-depth: 0
+          path: base
+
+      - name: Check out HEAD (PR head repo)
+        if: steps.extract.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.repo_token || github.token }}
+          repository: ${{ steps.extract.outputs.head_repo }}
+          fetch-depth: 0
+          path: head
+
+      - name: Create branch and copy the single file
+        if: steps.extract.outputs.skip != 'true'
+        id: branch_and_copy
+        run: |
+          set -euo pipefail
+
+          FILE_PATH="${{ steps.extract.outputs.file_path }}"
+          PR_NUMBER="${{ steps.extract.outputs.pr_number }}"
+          BASE_REF="${{ steps.extract.outputs.base_ref }}"
+
+          # Only keep alphanumeric characters from file name
+          SAFE_FILE="$(echo "$FILE_PATH" | sed 's/[^0-9a-zA-Z/._]*//g' | tr -d '\n')"
+          BRANCH="bot/file-${SAFE_FILE}-from-PR${PR_NUMBER}"
+          printf $'SAFE_FILE: %s\nBRANCH: %s\n' "${SAFE_FILE}" "${BRANCH}"
+
+          echo "BRANCH=$BRANCH" | tee -a "$GITHUB_OUTPUT"
+
+          cd base
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout "${BASE_REF}"
+
+          # Ensure directory exists for the target file
+          mkdir -p "$(dirname "$FILE_PATH")"
+
+          # Copy or delete the file to match HEAD state
+          if [ -f "../head/${FILE_PATH}" ]; then
+            echo "Copying file from PR head: ${FILE_PATH}"
+            cp -f "../head/${FILE_PATH}" "${FILE_PATH}"
+            git add "${FILE_PATH}"
+          else
+            echo "File not present at PR head path: ${FILE_PATH}"
+          fi
+
+          if git diff --cached --quiet; then
+            echo "No changes staged for ${FILE_PATH} vs base ${BASE_REF}"
+            echo "NO_CHANGES=true" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+      - name: Create Pull Request
+        if: steps.extract.outputs.skip != 'true'
+        id: cpr
+        uses: peter-evans/create-pull-request@98357b18bf14b5342f975ff684046ec3b2a07725 #v8.0.0
+        with:
+          committer: ${{ inputs.committer }}
+          author: ${{ inputs.author }}
+          path: base
+          base: ${{ steps.extract.outputs.base_ref }}
+          token: ${{ secrets.token || github.token }}
+          commit-message: "Automated addition of changes in ${{ steps.extract.outputs.file_path }}"
+          title: "chore(${{ steps.extract.outputs.file_path }}): automated extraction"
+          body: "This PR was automatically created from a review comment on PR #${{ steps.extract.outputs.pr_number }}."
+          branch: ${{ steps.branch_and_copy.outputs.BRANCH }}
+          branch-suffix: random
+          delete-branch: true
+
+      - name: Comment back on the original PR
+        if: steps.extract.outputs.skip != 'true' && steps.branch_and_copy.outputs.NO_CHANGES != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const originalPrNumber = Number('${{ steps.extract.outputs.pr_number }}');
+            const repoFull = '${{ steps.extract.outputs.base_repo }}';
+            const [owner, repo] = repoFull.split('/');
+            const automatedPrNumber = '${{ steps.cpr.outputs.pull-request-number }}';
+            const filePath = '${{ steps.extract.outputs.file_path }}';
+
+            const body = `Split off the changes to **${filePath}** in #${automatedPrNumber}`;
+            await github.rest.issues.createComment({ owner, repo, issue_number: originalPrNumber, body });
