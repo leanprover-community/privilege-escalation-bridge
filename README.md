@@ -160,6 +160,8 @@ Path: `consume/action.yml`
   - Optional exact match against `meta.workflow_name`.
 - `expected_head_sha`
   - Optional exact match against `meta.head_sha`.
+  - Usually not needed for `workflow_run` consumers because `run_id` (and `run_attempt` when present) are already validated by default.
+  - For `pull_request` producers, this is often the synthetic merge commit SHA (`refs/pull/<n>/merge`), which changes when the base branch moves and can make this check brittle.
 - `expected_pr_number`
   - Optional exact match against `meta.pr_number`.
 - `require_event` (comma/newline-separated event names)
@@ -198,6 +200,7 @@ When `fail_on_missing=false` and the artifact is not found, `outputs-json` is `{
 - `meta.repository` matches current repository.
 - `meta.workflow_run_id` matches requested `run_id`.
 - `meta.workflow_run_attempt` matches triggering `workflow_run.run_attempt` when available.
+  - These checks are typically sufficient to bind the artifact to the triggering workflow run.
 
 `consume` optionally validates when inputs are provided:
 - `source_workflow` -> `meta.workflow_name`
