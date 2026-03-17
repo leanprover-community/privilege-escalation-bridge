@@ -1,0 +1,22 @@
+name: Smoke Consume Missing Token
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: consume
+        continue-on-error: true
+        uses: ./consume
+        with:
+          run_id: '123'
+
+      - name: Assert missing token failure
+        shell: bash
+        run: |
+          test "${{ steps.consume.outcome }}" = "failure"
+          echo "SMOKE_CONSUME_MISSING_TOKEN_OK"

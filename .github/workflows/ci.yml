@@ -30,3 +30,27 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  act-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm install
+
+      - name: Install act
+        run: |
+          mkdir -p "$RUNNER_TEMP/act-bin"
+          curl -fsSL https://github.com/nektos/act/releases/download/v0.2.82/act_Linux_x86_64.tar.gz \
+            | tar -xzf - -C "$RUNNER_TEMP/act-bin" act
+          echo "$RUNNER_TEMP/act-bin" >> "$GITHUB_PATH"
+
+      - name: Run act smoke tests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: tests/actions/run_act_smoke.sh
