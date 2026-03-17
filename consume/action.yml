@@ -3,7 +3,7 @@ description: Download, validate, and expose bridge artifact data from workflow_r
 author: leanprover-community
 inputs:
   token:
-    description: Token with actions:read for downloading artifacts (recommended)
+    description: Token with actions:read for downloading artifacts (recommended; no implicit default)
     required: false
   github_token:
     description: Deprecated alias for token. Token with actions:read for downloading artifacts

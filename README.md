@@ -146,11 +146,13 @@ Path: `consume/action.yml`
 ### Inputs
 - `token` (recommended)
   - Token with `actions:read` for downloading artifacts.
+  - No default is set by this action.
   - In reusable workflows, pass explicitly: `token: ${{ github.token }}`.
 - `github_token` (deprecated alias for `token`)
   - Supported for backward compatibility.
 - Env fallback
   - If neither input is set, `consume` checks `GITHUB_TOKEN` then `GH_TOKEN`.
+  - Caller `env` values are not automatically inherited by reusable workflows.
   - Must allow `actions:read` in the target repository.
 - `artifact` (default: `bridge`)
   - Artifact name to download from the producer run.
