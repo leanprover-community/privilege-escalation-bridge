@@ -1,0 +1,22 @@
+name: Smoke Consume Missing Run ID
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: consume
+        continue-on-error: true
+        uses: ./consume
+        with:
+          token: dummy-token
+
+      - name: Assert missing run id failure
+        shell: bash
+        run: |
+          test "${{ steps.consume.outcome }}" = "failure"
+          echo "SMOKE_CONSUME_MISSING_RUN_ID_OK"

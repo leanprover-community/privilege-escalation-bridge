@@ -1,0 +1,22 @@
+name: Smoke Emit Invalid Outputs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: emit
+        continue-on-error: true
+        uses: ./emit
+        with:
+          outputs: '{'
+
+      - name: Assert invalid outputs failure
+        shell: bash
+        run: |
+          test "${{ steps.emit.outcome }}" = "failure"
+          echo "SMOKE_EMIT_INVALID_OUTPUTS_OK"

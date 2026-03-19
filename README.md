@@ -296,14 +296,6 @@ npm test
 npm run build
 ```
 
-## CI
-
-CI workflow runs on pull requests and main/master pushes:
-- `npm ci`
-- `npm run lint`
-- `npm run typecheck`
-- `npm test`
-- `npm run build`
 
 ## License
 
