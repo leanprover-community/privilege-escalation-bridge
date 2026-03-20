@@ -30,6 +30,13 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - name: Check committed dist is up to date
+        run: |
+          if ! git diff --quiet -- dist; then
+            echo "Committed dist/ is out of date. Run 'npm run build' and commit the updated bundle."
+            git diff -- dist
+            exit 1
+          fi
 
   act-smoke:
     runs-on: ubuntu-latest
