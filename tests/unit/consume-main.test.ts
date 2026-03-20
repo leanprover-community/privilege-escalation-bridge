@@ -172,6 +172,57 @@ describe('consume action entrypoint', () => {
     await expect(run()).rejects.toThrow(/Missing extracted value for 'missing'/);
   });
 
+  it('supports override_json without token or artifact download', async () => {
+    hoisted.state.inputs = {
+      override_json: JSON.stringify({
+        meta: {
+          schema_version: 2,
+          repository: hoisted.state.repository,
+          workflow_name: 'WF',
+          workflow_run_id: String(hoisted.state.workflowRunId),
+          workflow_run_attempt: '1',
+          event_name: 'issue_comment',
+          head_sha: 'abc',
+          created_at: new Date().toISOString(),
+          event: { comment: { user: { login: 'alice' } } }
+        },
+        outputs: { answer: '42' }
+      }),
+      expose: 'both',
+      extract: 'commenter=event.comment.user.login',
+      path: ''
+    };
+
+    const { run } = await import('../../src/consume/main.js');
+    await run();
+
+    expect(hoisted.github.getOctokit).not.toHaveBeenCalled();
+    expect(hoisted.state.outputs).toContainEqual({ name: 'answer', value: '42' });
+    expect(hoisted.state.outputs).toContainEqual({ name: 'commenter', value: 'alice' });
+    expect(hoisted.state.outputs).toContainEqual({ name: 'outputs-json', value: JSON.stringify({ answer: '42' }) });
+    expect(hoisted.state.outputs).not.toContainEqual({ name: 'files-path', value: expect.any(String) });
+  });
+
+  it('fails on invalid override_json', async () => {
+    hoisted.state.inputs = {
+      override_json: '{',
+      path: ''
+    };
+
+    const { run } = await import('../../src/consume/main.js');
+    await expect(run()).rejects.toThrow(/override_json must be valid JSON/);
+  });
+
+  it('fails when override_json is not an object', async () => {
+    hoisted.state.inputs = {
+      override_json: '[]',
+      path: ''
+    };
+
+    const { run } = await import('../../src/consume/main.js');
+    await expect(run()).rejects.toThrow(/override_json must be a JSON object/);
+  });
+
   it('does not fail when bridge/files is absent in downloaded artifact', async () => {
     const destination = await mkdtemp(path.join(os.tmpdir(), 'consume-main-'));
     const restorePath = path.join(destination, 'restore');

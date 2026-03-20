@@ -156,8 +156,14 @@ Path: `consume/action.yml`
   - Must allow `actions:read` in the target repository.
 - `artifact` (default: `bridge`)
   - Artifact name to download from the producer run.
+- `override_json`
+  - Optional JSON object with canonical bridge payload fields `meta` and `outputs`.
+  - When non-empty, `consume` skips token resolution and artifact download and uses this payload instead.
+  - `meta` must satisfy the normal bridge metadata schema; `outputs` must be a JSON object with scalar values.
+  - `bridge/files` restore is not supported in this mode, so `files-path` is not emitted.
 - `run_id` (defaults to triggering `workflow_run.id`)
   - Required unless the action is running under a `workflow_run` event.
+  - In `override_json` mode, this binding is only checked when a run id is available from input or event context.
 - `source_workflow`
   - Optional exact match against `meta.workflow_name`.
 - `expected_head_sha`
@@ -192,7 +198,7 @@ Path: `consume/action.yml`
 - `outputs-json`
 - `meta-json`
 - `event-json`
-- `files-path`
+- `files-path` when artifact-backed restore ran
 
 When `fail_on_missing=false` and the artifact is not found, `outputs-json` is `{}`. You can skip downstream work with a guard like `if: ${{ steps.bridge.outputs.outputs-json != '{}' }}`.
 

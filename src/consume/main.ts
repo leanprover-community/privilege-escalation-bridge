@@ -6,7 +6,13 @@ import * as core from '@actions/core';
 import { context, getOctokit } from '@actions/github';
 import AdmZip from 'adm-zip';
 
-import { type BridgeMeta, type OutputsMap } from '../lib/schema.js';
+import {
+  normalizeOutputs,
+  parseJsonObject,
+  validateMeta,
+  type BridgeMeta,
+  type OutputsMap
+} from '../lib/schema.js';
 import {
   getByPath,
   parseExtractMappings,
@@ -18,11 +24,11 @@ import {
 import { createLogger, debugJson, type Logger } from '../lib/logging.js';
 import { resolveAuthToken } from './token.js';
 
-interface DownloadedBridge {
+interface LoadedBridge {
   meta: BridgeMeta;
   outputs: OutputsMap;
-  filesDir: string;
-  tempDir: string;
+  filesDir?: string;
+  tempDir?: string;
 }
 
 function parseExposeMode(): 'outputs' | 'env' | 'both' {
@@ -49,7 +55,7 @@ async function downloadBridgeArtifact(
   runId: number,
   artifactName: string,
   failOnMissing: boolean
-): Promise<DownloadedBridge | null> {
+): Promise<LoadedBridge | null> {
   const [owner, repo] = repository.split('/');
   const octokit = getOctokit(token);
 
@@ -100,7 +106,7 @@ async function downloadBridgeArtifact(
   };
 }
 
-function validateExpectations(meta: BridgeMeta, runId: number): void {
+function validateExpectations(meta: BridgeMeta, runId?: number): void {
   const expectedRepository = process.env.GITHUB_REPOSITORY || `${context.repo.owner}/${context.repo.repo}`;
   const sourceWorkflow = core.getInput('source_workflow');
   const expectedHeadSha = core.getInput('expected_head_sha');
@@ -110,13 +116,38 @@ function validateExpectations(meta: BridgeMeta, runId: number): void {
 
   validateConsumerExpectations(meta, {
     repository: expectedRepository,
-    runId: String(runId),
-    runAttempt: triggerAttempt ? String(triggerAttempt) : undefined,
+    runId: runId ? String(runId) : undefined,
+    runAttempt: runId && triggerAttempt ? String(triggerAttempt) : undefined,
     sourceWorkflow: sourceWorkflow || undefined,
     expectedHeadSha: expectedHeadSha || undefined,
     expectedPrNumber: expectedPrNumber || undefined,
     requireEvents: requireEvent
   });
+}
+
+function loadOverrideBridge(logger: Logger, raw: string): LoadedBridge {
+  const parsed = parseJsonObject(raw, 'override_json');
+  const metaRaw = parsed.meta;
+  const outputsRaw = parsed.outputs ?? {};
+
+  if (!metaRaw || typeof metaRaw !== 'object' || Array.isArray(metaRaw)) {
+    throw new Error('override_json.meta must be a JSON object');
+  }
+  if (!outputsRaw || typeof outputsRaw !== 'object' || Array.isArray(outputsRaw)) {
+    throw new Error('override_json.outputs must be a JSON object');
+  }
+
+  const meta = metaRaw as Record<string, unknown>;
+  validateMeta(meta);
+  const outputs = normalizeOutputs(outputsRaw as Record<string, unknown>, 'strict');
+
+  debugJson(logger, 'override meta', meta);
+  debugJson(logger, 'override output keys', Object.keys(outputs));
+
+  return {
+    meta,
+    outputs
+  };
 }
 
 function emitExtractedValues(
@@ -145,13 +176,8 @@ function emitExtractedValues(
 
 export async function run(): Promise<void> {
   const logger = createLogger();
-  const token = resolveAuthToken({
-    tokenInput: core.getInput('token'),
-    githubTokenInput: core.getInput('github_token'),
-    envGithubToken: process.env.GITHUB_TOKEN,
-    envGhToken: process.env.GH_TOKEN
-  });
-
+  const overrideJson = core.getInput('override_json');
+  const overrideEnabled = overrideJson.trim() !== '';
   const artifactName = core.getInput('artifact') || 'bridge';
   const runId = Number(core.getInput('run_id') || context.payload.workflow_run?.id);
   const failOnMissing = core.getBooleanInput('fail_on_missing', { required: false });
@@ -161,6 +187,7 @@ export async function run(): Promise<void> {
   const repository = process.env.GITHUB_REPOSITORY || `${context.repo.owner}/${context.repo.repo}`;
 
   await logger.withGroup('Bridge Consume: Inputs', () => {
+    logger.info(`Source mode: ${overrideEnabled ? 'override_json' : 'artifact'}`);
     logger.info(`Artifact name: ${artifactName}`);
     logger.info(`Source run id: ${String(runId || '(unset)')}`);
     logger.info(`Expose mode: ${expose}`);
@@ -174,16 +201,30 @@ export async function run(): Promise<void> {
       logger.debug(`expected_pr_number: ${core.getInput('expected_pr_number') || '(none)'}`);
       logger.debug(`require_event: ${core.getInput('require_event') || '(none)'}`);
       logger.debug(`extract mappings provided: ${core.getInput('extract') ? 'yes' : 'no'}`);
+      logger.debug(`override_json provided: ${overrideEnabled ? 'yes' : 'no'}`);
     }
   });
 
-  if (!runId || Number.isNaN(runId)) {
+  if (!overrideEnabled && (!runId || Number.isNaN(runId))) {
     throw new Error('run_id is required (or action must run from workflow_run event)');
   }
 
-  const bridge = await logger.withGroup('Bridge Consume: Download Artifact', () =>
-    downloadBridgeArtifact(logger, token, repository, runId, artifactName, failOnMissing)
-  );
+  let bridge: LoadedBridge | null;
+  if (overrideEnabled) {
+    bridge = await logger.withGroup('Bridge Consume: Load Override', () =>
+      Promise.resolve(loadOverrideBridge(logger, overrideJson))
+    );
+  } else {
+    const token = resolveAuthToken({
+      tokenInput: core.getInput('token'),
+      githubTokenInput: core.getInput('github_token'),
+      envGithubToken: process.env.GITHUB_TOKEN,
+      envGhToken: process.env.GH_TOKEN
+    });
+    bridge = await logger.withGroup('Bridge Consume: Download Artifact', () =>
+      downloadBridgeArtifact(logger, token, repository, runId, artifactName, failOnMissing)
+    );
+  }
   if (!bridge) {
     core.info('Bridge artifact not found and fail_on_missing=false; exiting without outputs.');
     core.setOutput('outputs-json', JSON.stringify({}));
@@ -193,18 +234,24 @@ export async function run(): Promise<void> {
   }
 
   await logger.withGroup('Bridge Consume: Validate Metadata', () => {
-    validateExpectations(bridge.meta, runId);
+    validateExpectations(bridge.meta, runId || undefined);
     logger.info('Metadata validation passed.');
   });
 
-  await logger.withGroup('Bridge Consume: Restore Files', async () => {
-    const restored = await restoreBridgeFiles(bridge.filesDir, destination);
-    if (restored) {
-      logger.info(`Restored files to ${destination}`);
-    } else {
-      logger.info("No 'bridge/files' directory in artifact; skipping file restore.");
-    }
-  });
+  if (bridge.filesDir) {
+    await logger.withGroup('Bridge Consume: Restore Files', async () => {
+      const restored = await restoreBridgeFiles(bridge.filesDir as string, destination);
+      if (restored) {
+        logger.info(`Restored files to ${destination}`);
+      } else {
+        logger.info("No 'bridge/files' directory in artifact; skipping file restore.");
+      }
+    });
+  } else if (overrideEnabled) {
+    await logger.withGroup('Bridge Consume: Restore Files', () => {
+      logger.info('override_json mode does not support bridge/files restore; skipping.');
+    });
+  }
 
   await logger.withGroup('Bridge Consume: Expose Outputs', () => {
     for (const [key, value] of Object.entries(bridge.outputs)) {
@@ -226,9 +273,13 @@ export async function run(): Promise<void> {
   core.setOutput('outputs-json', JSON.stringify(bridge.outputs));
   core.setOutput('meta-json', JSON.stringify(bridge.meta));
   core.setOutput('event-json', JSON.stringify(bridge.meta.event || {}));
-  core.setOutput('files-path', destination);
+  if (bridge.filesDir) {
+    core.setOutput('files-path', destination);
+  }
 
-  await rm(bridge.tempDir, { recursive: true, force: true });
+  if (bridge.tempDir) {
+    await rm(bridge.tempDir, { recursive: true, force: true });
+  }
   logger.info('Bridge consume completed.');
 }
 

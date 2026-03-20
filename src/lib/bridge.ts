@@ -25,7 +25,7 @@ export interface ProducerContext {
 
 export interface ConsumerExpectations {
   repository: string;
-  runId: string;
+  runId?: string;
   runAttempt?: string;
   sourceWorkflow?: string;
   expectedHeadSha?: string;
@@ -141,10 +141,10 @@ export function validateConsumerExpectations(
   if (meta.repository !== expectations.repository) {
     throw new Error(`Repository mismatch: expected ${expectations.repository}, got ${meta.repository}`);
   }
-  if (meta.workflow_run_id !== expectations.runId) {
+  if (expectations.runId && meta.workflow_run_id !== expectations.runId) {
     throw new Error(`Run mismatch: expected ${expectations.runId}, got ${meta.workflow_run_id}`);
   }
-  if (expectations.runAttempt && meta.workflow_run_attempt !== expectations.runAttempt) {
+  if (expectations.runId && expectations.runAttempt && meta.workflow_run_attempt !== expectations.runAttempt) {
     throw new Error(
       `Run attempt mismatch: expected ${expectations.runAttempt}, got ${meta.workflow_run_attempt}`
     );

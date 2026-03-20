@@ -46,6 +46,9 @@ inputs:
     description: Destination directory for restored bridge/files
     required: false
     default: .bridge
+  override_json:
+    description: Optional JSON object with canonical bridge payload fields `meta` and `outputs`; skips artifact download and does not restore bridge/files
+    required: false
 outputs:
   outputs-json:
     description: JSON object of bridge outputs
@@ -54,7 +57,7 @@ outputs:
   event-json:
     description: JSON object for meta.event
   files-path:
-    description: Directory where files were restored
+    description: Directory where files were restored when artifact-backed bridge/files content exists
 runs:
   using: node24
   main: ../dist/consume/index.js
