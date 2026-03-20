@@ -133,7 +133,7 @@ function emitExtractedValues(
   for (const mapping of mappings) {
     const value = getByPath({ outputs, meta, event: meta.event || {} }, mapping.path);
     if (value === undefined) {
-      continue;
+      throw new Error(`Missing extracted value for '${mapping.name}' at path '${mapping.path}'`);
     }
     const serialized = value === null ? 'null' : String(value);
     writeMaybeOutput(mapping.name, serialized, expose);

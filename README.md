@@ -181,7 +181,7 @@ Path: `consume/action.yml`
   - Not applied to names from `extract` mappings.
 - `extract` newline-separated mappings: `NAME=source.path`
   - Supported roots: `outputs`, `meta`, `event`.
-  - Only scalar values are extracted (object/array values are skipped).
+  - Every configured mapping must resolve to a scalar value or `null`; missing paths fail the action.
   - Fallback paths are supported: `a.b|c.d` (first found wins).
 - `path` restore destination for `bridge/files` (default `.bridge`)
   - Files are copied into this directory recursively.

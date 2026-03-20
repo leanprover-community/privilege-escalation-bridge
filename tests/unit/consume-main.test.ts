@@ -165,6 +165,13 @@ describe('consume action entrypoint', () => {
     expect(hoisted.state.outputs).toContainEqual({ name: 'files-path', value: destination });
   });
 
+  it('fails when an extract mapping does not resolve', async () => {
+    hoisted.state.inputs.extract = 'missing=event.comment.id';
+
+    const { run } = await import('../../src/consume/main.js');
+    await expect(run()).rejects.toThrow(/Missing extracted value for 'missing'/);
+  });
+
   it('does not fail when bridge/files is absent in downloaded artifact', async () => {
     const destination = await mkdtemp(path.join(os.tmpdir(), 'consume-main-'));
     const restorePath = path.join(destination, 'restore');
