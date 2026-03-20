@@ -14,7 +14,8 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src tests eslint.config.js vitest.config.ts",
-    "ci": "npm run lint && npm run typecheck && npm run test && npm run build"
+    "ci": "npm run lint && npm run typecheck && npm run test && npm run build",
+    "release:check": "npm run ci"
   },
   "dependencies": {
     "@actions/artifact": "^6.1.0",
