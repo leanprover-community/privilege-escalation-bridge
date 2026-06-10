@@ -1,0 +1,45 @@
+name: Smoke Consume Success
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Happy path uses override_json so the run needs no artifact server or
+      # network: it exercises override parsing, metadata + repository-binding
+      # validation, extract mappings, and output exposure end to end under a
+      # real runner. (emit's upload path cannot complete under act, so emit's
+      # happy path is covered by the unit and e2e tests instead.)
+      - id: consume
+        uses: ./consume
+        with:
+          override_json: |
+            {
+              "meta": {
+                "schema_version": 2,
+                "repository": "${{ github.repository }}",
+                "workflow_name": "WF",
+                "workflow_run_id": "1",
+                "workflow_run_attempt": "1",
+                "event_name": "issue_comment",
+                "head_sha": "abc",
+                "created_at": "2024-01-01T00:00:00Z",
+                "event": { "comment": { "user": { "login": "alice" } } }
+              },
+              "outputs": { "answer": "42" }
+            }
+          extract: |
+            commenter=event.comment.user.login
+          expose: outputs
+
+      - name: Assert consume success
+        shell: bash
+        run: |
+          test "${{ steps.consume.outcome }}" = "success"
+          test "${{ steps.consume.outputs.answer }}" = "42"
+          test "${{ steps.consume.outputs.commenter }}" = "alice"
+          echo "SMOKE_CONSUME_SUCCESS_OK"

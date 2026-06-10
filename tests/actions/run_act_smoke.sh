@@ -15,6 +15,27 @@ require_cmd() {
   fi
 }
 
+require_docker() {
+  # act talks to the Docker daemon over its socket directly and does not shell
+  # out to the docker CLI. Prefer a CLI probe, but fall back to checking for a
+  # reachable daemon socket: some sandboxed environments expose the socket (all
+  # act needs) without making the docker CLI runnable in child processes, where
+  # both `command -v docker` and `docker version` fail.
+  if docker version >/dev/null 2>&1; then
+    return 0
+  fi
+  local sock="${DOCKER_HOST:-}"
+  sock="${sock#unix://}"
+  if [ -z "$sock" ]; then
+    sock="/var/run/docker.sock"
+  fi
+  if [ -S "$sock" ]; then
+    return 0
+  fi
+  echo "docker is required: need a runnable docker CLI or a reachable daemon socket ($sock)" >&2
+  exit 1
+}
+
 run_act_with_log() {
   local log_file="$1"
   shift
@@ -31,11 +52,13 @@ run_act_with_log() {
 check_expected_patterns() {
   local expected_file="$1"
   local log_file="$2"
+  local pattern_count=0
 
   while IFS= read -r pattern || [ -n "$pattern" ]; do
     if [ -z "$pattern" ]; then
       continue
     fi
+    pattern_count=$((pattern_count + 1))
     if ! grep -F -- "$pattern" "$log_file" >/dev/null 2>&1; then
       echo "missing expected log pattern: $pattern" >&2
       echo "--- begin act log ---" >&2
@@ -44,9 +67,14 @@ check_expected_patterns() {
       return 1
     fi
   done <"$expected_file"
+
+  if [ "$pattern_count" -eq 0 ]; then
+    echo "expected fixture has no patterns to assert: $expected_file" >&2
+    return 1
+  fi
 }
 
-require_cmd docker
+require_docker
 require_cmd npm
 require_cmd act
 
