@@ -63,9 +63,12 @@ async function downloadBridgeArtifact(
     owner,
     repo,
     run_id: runId,
+    name: artifactName,
     per_page: 100
   });
-  logger.info(`Found ${artifactsResp.data.artifacts.length} artifacts on source run.`);
+  logger.info(
+    `Found ${artifactsResp.data.artifacts.length} artifact(s) named '${artifactName}' on source run.`
+  );
   debugJson(
     logger,
     'source artifacts',
@@ -221,6 +224,7 @@ export async function run(): Promise<void> {
       envGithubToken: process.env.GITHUB_TOKEN,
       envGhToken: process.env.GH_TOKEN
     });
+    core.setSecret(token);
     bridge = await logger.withGroup('Bridge Consume: Download Artifact', () =>
       downloadBridgeArtifact(logger, token, repository, runId, artifactName, failOnMissing)
     );

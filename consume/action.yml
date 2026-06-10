@@ -57,7 +57,7 @@ outputs:
   event-json:
     description: JSON object for meta.event
   files-path:
-    description: Directory where files were restored when artifact-backed bridge/files content exists
+    description: Restore destination for bridge/files. Emitted in artifact mode (never in override_json mode), even when the artifact had no bridge/files content; in that case nothing is restored and the directory may not exist.
 runs:
   using: node24
   main: ../dist/consume/index.js

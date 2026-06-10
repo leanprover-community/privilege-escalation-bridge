@@ -200,7 +200,8 @@ Path: `consume/action.yml`
 - `outputs-json`
 - `meta-json`
 - `event-json`
-- `files-path` when artifact-backed restore ran
+- `files-path` restore destination, emitted in artifact mode (never in `override_json` mode)
+  - Emitted whenever the action runs against a downloaded artifact, even when that artifact had no `bridge/files` content. In that case nothing is restored and the directory may not exist, so check for its presence before reading from it.
 
 When `fail_on_missing=false` and the artifact is not found, `outputs-json` is `{}`. You can skip downstream work with a guard like `if: ${{ steps.bridge.outputs.outputs-json != '{}' }}`.
 

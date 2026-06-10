@@ -34912,7 +34912,7 @@ function exportVariable(name, val) {
  * ```
  */
 function core_setSecret(secret) {
-    issueCommand('add-mask', {}, secret);
+    command_issueCommand('add-mask', {}, secret);
 }
 /**
  * Prepends inputPath to the PATH (for this action and future actions)
@@ -39604,9 +39604,10 @@ async function downloadBridgeArtifact(logger, token, repository, runId, artifact
         owner,
         repo,
         run_id: runId,
+        name: artifactName,
         per_page: 100
     });
-    logger.info(`Found ${artifactsResp.data.artifacts.length} artifacts on source run.`);
+    logger.info(`Found ${artifactsResp.data.artifacts.length} artifact(s) named '${artifactName}' on source run.`);
     debugJson(logger, 'source artifacts', artifactsResp.data.artifacts.map((a) => ({ id: a.id, name: a.name, size_in_bytes: a.size_in_bytes })));
     const artifactInfo = artifactsResp.data.artifacts.find((a) => a.name === artifactName);
     if (!artifactInfo) {
@@ -39734,6 +39735,7 @@ async function run() {
             envGithubToken: process.env.GITHUB_TOKEN,
             envGhToken: process.env.GH_TOKEN
         });
+        core_setSecret(token);
         bridge = await logger.withGroup('Bridge Consume: Download Artifact', () => downloadBridgeArtifact(logger, token, repository, runId, artifactName, failOnMissing));
     }
     if (!bridge) {

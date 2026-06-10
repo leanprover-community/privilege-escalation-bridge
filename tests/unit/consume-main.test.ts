@@ -23,6 +23,7 @@ const hoisted = vi.hoisted(() => {
   const core = {
     getInput: vi.fn((name: string) => state.inputs[name] ?? ''),
     getBooleanInput: vi.fn((name: string) => state.booleans[name] ?? false),
+    setSecret: vi.fn(),
     setOutput: vi.fn((name: string, value: string) => {
       state.outputs.push({ name, value });
     }),
@@ -163,6 +164,9 @@ describe('consume action entrypoint', () => {
     expect(hoisted.state.env).toContainEqual({ name: 'repo', value: hoisted.state.repository });
     expect(hoisted.state.outputs).not.toContainEqual({ name: 'pre_answer', value: '42' });
     expect(hoisted.state.outputs).toContainEqual({ name: 'files-path', value: destination });
+    expect(hoisted.octokit.rest.actions.listWorkflowRunArtifacts).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'bridge' })
+    );
   });
 
   it('fails when an extract mapping does not resolve', async () => {
