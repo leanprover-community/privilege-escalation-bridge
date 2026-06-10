@@ -5,6 +5,8 @@ This repository provides two TypeScript-based JavaScript actions implementing a 
 1. Unprivileged workflow (`pull_request`, `issue_comment`, `pull_request_review`, etc.) emits structured data as an artifact.
 2. Privileged workflow (`workflow_run`) consumes and validates that artifact before doing writes/secrets operations.
 
+Contributing or developing locally? See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Actions
 
 | Action | Purpose |
