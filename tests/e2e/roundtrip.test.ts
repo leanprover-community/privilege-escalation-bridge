@@ -9,7 +9,9 @@ import {
   parseAndMergeOutputs,
   readBridgeDirectory,
   validateConsumerExpectations,
-  writeBridgeDirectory
+  validateUpstreamRun,
+  writeBridgeDirectory,
+  type UpstreamRun
 } from '../../src/lib/bridge.js';
 
 describe('e2e bridge roundtrip', () => {
@@ -47,6 +49,16 @@ describe('e2e bridge roundtrip', () => {
       expect(loaded.meta.workflow_run_id).toBe('777');
       expect(await readFile(path.join(loaded.filesDir, filePath), 'utf8')).toContain('world');
 
+      // GitHub's record of the producer run, as the consumer sees it in the workflow_run payload.
+      const upstream: UpstreamRun = {
+        id: '777',
+        runAttempt: '1',
+        event: 'issue_comment',
+        workflowName: 'Maintainer merge'
+      };
+      expect(() =>
+        validateUpstreamRun(upstream, { sourceWorkflow: 'Maintainer merge', requireEvents: ['issue_comment'] })
+      ).not.toThrow();
       expect(() =>
         validateConsumerExpectations(loaded.meta, {
           repository: 'leanprover-community/mathlib4',
@@ -55,7 +67,8 @@ describe('e2e bridge roundtrip', () => {
           sourceWorkflow: 'Maintainer merge',
           expectedHeadSha: 'abc123',
           expectedPrNumber: '12',
-          requireEvents: ['issue_comment']
+          requireEvents: ['issue_comment'],
+          upstream
         })
       ).not.toThrow();
     } finally {

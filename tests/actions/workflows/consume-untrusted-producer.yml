@@ -1,0 +1,48 @@
+name: Smoke Consume Untrusted Producer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      # The event fixture carries a workflow_run payload for a pull_request_review producer run,
+      # which consume must treat as untrusted. override_json stands in for the downloaded artifact.
+      BRIDGE_JSON: |
+        {
+          "meta": {
+            "schema_version": 2,
+            "repository": "${{ github.repository }}",
+            "workflow_name": "Producer",
+            "workflow_run_id": "4242",
+            "workflow_run_attempt": "1",
+            "event_name": "pull_request_review",
+            "head_sha": "abc",
+            "created_at": "2024-01-01T00:00:00Z"
+          },
+          "outputs": { "answer": "42" }
+        }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: default
+        continue-on-error: true
+        uses: ./consume
+        with:
+          override_json: ${{ env.BRIDGE_JSON }}
+
+      - id: opted_in
+        uses: ./consume
+        with:
+          override_json: ${{ env.BRIDGE_JSON }}
+          untrusted_producer_events: pull_request_review
+
+      - name: Assert untrusted producer handling
+        shell: bash
+        run: |
+          test "${{ steps.default.outcome }}" = "failure"
+          test "${{ steps.opted_in.outcome }}" = "success"
+          test "${{ steps.opted_in.outputs.producer-trust }}" = "untrusted"
+          test "${{ steps.opted_in.outputs.answer }}" = "42"
+          echo "SMOKE_CONSUME_UNTRUSTED_PRODUCER_OK"

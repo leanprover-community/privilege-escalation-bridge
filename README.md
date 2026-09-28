@@ -16,16 +16,90 @@ Contributing or developing locally? See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Security Model
 
-The bridge does not bypass GitHub's permissions model.
+The bridge does not bypass GitHub's permissions model. `consume` binds an artifact to the producer run that triggered it and reports who controlled that run's workflow file. It does not make artifact contents safe.
 
-Defenses included:
-- Source run binding: `meta.workflow_run_id` must match expected run.
-- Run-attempt binding: `meta.workflow_run_attempt` must match expected attempt when available.
-- Repository binding: `meta.repository` must match current repository.
-- Optional pinning: workflow name, event type, PR number, and head SHA checks.
-- Fail-closed defaults for missing artifact and validation mismatches.
+### Who controls the producer
 
-Non-goals:
+For most events, GitHub runs the producer workflow file from the default branch, or from another ref that only people with write access can change. For `pull_request`, `pull_request_review` and `pull_request_review_comment`, GitHub runs it from the pull request's merge ref. When the pull request comes from a fork, its author can edit the producer workflow in the PR. They keep its `name:`, which is all `on: workflow_run` matches on. The edited workflow can skip `emit` and upload any artifact under the expected name. Every byte of that artifact is then chosen by the fork author, including `meta.json`, `meta.event` and `outputs.json`. The run-binding checks still pass, because the job knows its own run id, attempt and repository.
+
+`consume` classifies the producer from GitHub's record of the run, never from the artifact. That record is the `workflow_run` event payload, or the REST API when `run_id` names a different run. `consume` exposes the result as the `producer-trust` output:
+
+| `producer-trust` | When |
+| --- | --- |
+| `untrusted` | Every `pull_request`, `pull_request_review` and `pull_request_review_comment` run, and any other `pull_request*` event except `pull_request_target` |
+| `trusted-workflow` | Every other event, including `pull_request_target` |
+| `unknown` | `override_json` mode without a matching `workflow_run` payload |
+
+The classification depends on the event alone, not on whether a particular pull request comes from a fork. That means a consumer behaves the same for every run of an event, instead of passing on same-repository pull requests and failing on the first fork. It also doesn't rely on GitHub's `head_repository`, which reports the base repository for review runs even when the pull request comes from a fork.
+
+An `untrusted` run is accepted in one of two ways:
+- **`verify: true`** (recommended when acting on a comment, review or PR number). `consume` fetches the pull request and the triggering comment or review from the GitHub API and checks them against GitHub's record of the run. Raw artifact values are then withheld, and only `run.*` and `verified.*` values are exposed. See [Verification](#verification).
+- **Listing the event in `untrusted_producer_events`**, which exposes the raw artifact values. Do this only when every bridge value, including `meta` and `event` fields, is treated as untrusted data. For example, a lint result that is posted back to the PR it came from.
+
+Otherwise `consume` fails, with a message saying what may be forged for that event.
+
+`trusted-workflow` means only the workflow file is trusted, not the job's inputs. If the producer job runs pull request code before `emit`, for example an `issue_comment` workflow that builds the PR, that code can tamper with the later steps of the same job, including `emit` itself. The whole artifact can then be forged. Run pull request code in a separate job from `emit`, and pass its results across as data.
+
+### Producer events
+
+| Producer event | Workflow file comes from | `producer-trust` | `run.actor` | Recommended consumer |
+| --- | --- | --- | --- | --- |
+| `issue_comment` | the default branch | `trusted-workflow` | the commenter | Raw values are fine, as long as the producer job runs no PR code. `verify: true` also works. |
+| `pull_request` | the PR's merge ref | `untrusted` | whoever's action triggered the event, such as the pusher | Treat the artifact as data: list the event in `untrusted_producer_events`, and use `verify: true` for the PR number. |
+| `pull_request_review` | the PR's merge ref | `untrusted` | the reviewer | `verify: true`. Authorize from `verified.trigger.author` and act on `verified.trigger.body` and `verified.pr.number`. |
+| `pull_request_review_comment` | the PR's merge ref | `untrusted` | the commenter | `verify: true`, as for reviews. |
+| `pull_request_target` | the PR's base branch | `trusted-workflow` | | Such workflows often check out and run PR code; see the caveat above. |
+| `push`, `workflow_dispatch` | the pushed or chosen branch | `trusted-workflow` | the pusher or dispatcher | Anyone who can push to that branch controls the workflow file. |
+| `schedule`, `workflow_run` | the default branch | `trusted-workflow` | | |
+
+`run.actor` is GitHub's record of who triggered the producer run, and a forged artifact cannot change it. But for review events the producer runs whenever *anyone* reviews the PR. So a genuine reviewer does not prove the command: a forged artifact can claim they wrote something else, or name a different PR. `verify: true` closes that gap by fetching the review itself.
+
+`run.head_sha` is the PR head for `pull_request*` runs. For review runs, it is the head when GitHub *created* the run, which can be a commit pushed after the review.
+
+### Verified and self-reported fields
+
+After validation, these fields match GitHub's record of the producer run:
+- `meta.workflow_run_id`, and `meta.workflow_run_attempt` when `consume` runs from the triggering `workflow_run` event.
+- `meta.repository`, which must equal the current repository.
+- `meta.event_name`, which must equal `workflow_run.event`. `require_event` is evaluated against `workflow_run.event`.
+- `meta.workflow_name`, which must equal `workflow_run.name`. `source_workflow` is evaluated against `workflow_run.name`.
+- Every `run.*` value, which comes from that record directly.
+- Every `verified.*` value, which `consume` fetched from the API and checked (see [Verification](#verification)).
+
+These fields are self-reported by the producer. They are only as trustworthy as the producer's workflow file:
+- `meta.head_sha`, checked by `expected_head_sha`. This is the producer's `GITHUB_SHA`, which for `pull_request*` events is the PR merge commit, not `workflow_run.head_sha`.
+- `meta.pr_number`, checked by `expected_pr_number`.
+- `meta.event`, including actor fields such as `event.comment.user.login` and `event.review.user.login`.
+- `outputs.json`, `bridge/files`, and any extra `meta` keys.
+
+### Carrying an identity or PR number
+
+When a consumer acts on behalf of whoever wrote a comment or review, take the identity from `verified.trigger.author`, never from `event.*`. Take the PR from `verified.pr.number`, never from `meta.pr_number`. With an `issue_comment`-only producer, the `event.*` actor fields are written by a trusted workflow. `verify: true` still gives the same values for every event.
+
+### Verification
+
+With `verify: true`, `consume` re-fetches what the consumer acts on from the GitHub API. It uses the artifact only for hints: `meta.pr_number`, and `event.comment.id` or `event.review.id`. A forged hint makes a check fail; it cannot redirect `consume` to someone else's object.
+
+| Producer event | Fetches | Checks |
+| --- | --- | --- |
+| `pull_request` | `GET /pulls/{n}` | The PR's head is `run.head_sha`. |
+| `issue_comment` | `GET /issues/comments/{id}`, then the PR from its `issue_url` (omitted for a plain issue) | Author, timing, and `meta.pr_number` if present |
+| `pull_request_review` | `GET /pulls/{n}/reviews/{id}`, which only finds the review on PR `n`; then the PR | Author, timing |
+| `pull_request_review_comment` | `GET /pulls/comments/{id}`, then the PR from its `pull_request_url` | Author, timing, and `meta.pr_number` if present |
+
+- **Author:** the object's author must be `run.actor`. For an edit event, the actor is the editor. So an author editing their own comment counts as a fresh command, and an edit by anyone else fails.
+- **Timing:** the object must have been written no later than the producer run was created. That stops a producer from waiting for the actor's next comment and claiming it. It must also have last changed at most 24 hours before the run was created, which stops replays of old commands. The last change is used because edits and inline comments drafted in a pending review are published later than they were written. Reviews expose only `submitted_at`, so both limits use it. Across a year of mathlib4 review runs, the longest real gap between a review and its run was 84 minutes.
+- **Stale `pull_request` runs:** if the PR has been pushed to since the producer ran, its head no longer matches and `consume` fails. That can't be told apart from a forged PR number. A newer run follows the push.
+- Every failed check fails the step. It never exits with empty outputs.
+
+Verified values, as the `verified.*` extract root and the `verified-json` output:
+- `verified.pr`: `number`, `title`, `url`, `author`, `state`, `merged`, `head_sha` (the PR's current head), `head_ref`, `head_repo`, `is_fork`, `base_ref`.
+- `verified.trigger` (comment and review events): `kind` (`issue_comment`, `review` or `review_comment`), `id`, `author`, `author_type` (`User` or `Bot`), `body` (the text when `consume` fetched it, including later edits), `url`, `created_at`, `updated_at`, `path` (review comments) and `state` (reviews).
+
+`verify` needs `pull-requests: read`, plus `issues: read` for issue comments. It needs the IDs in the artifact: `include_event: minimal` in `emit` v2 includes them, and with `event_fields`, list `comment.id` and `review.id`. Other producer events are not supported and fail with `verify: true`.
+
+### Non-goals
+
 - Trusting artifact contents as safe.
 - Passing secrets through artifacts.
 - Preventing logical misuse of untrusted outputs by downstream steps.
@@ -55,7 +129,7 @@ Required fields (always provided by `emit`):
 - `workflow_run_id` - Producer run id as a string.
 - `workflow_run_attempt` - Producer run attempt as a string.
 - `event_name` - Producer event name (for example `pull_request`, `issue_comment`).
-- `head_sha` - Producer commit SHA.
+- `head_sha` - Producer commit SHA (`GITHUB_SHA`). For `pull_request*` events this is the PR merge commit.
 - `created_at` - ISO timestamp generated by `emit`.
 
 Optional fields (provided by `emit` when available):
@@ -85,9 +159,11 @@ Exact `include_event: minimal` paths:
 - `issue.title`
 - `issue.html_url`
 - `issue.user.login`
+- `comment.id`
 - `comment.body`
 - `comment.path`
 - `comment.user.login`
+- `review.id`
 - `review.body`
 - `review.state`
 - `review.user.login`
@@ -147,7 +223,7 @@ Path: `consume/action.yml`
 
 ### Inputs
 - `token` (recommended)
-  - Token with `actions:read` for downloading artifacts.
+  - Token with `actions:read` for downloading artifacts. With `verify: true`, it also needs `pull-requests: read`, plus `issues: read` for issue comments.
   - No default is set by this action.
   - In reusable workflows, pass explicitly: `token: ${{ github.token }}`.
 - `github_token` (deprecated alias for `token`)
@@ -160,22 +236,29 @@ Path: `consume/action.yml`
   - Artifact name to download from the producer run.
 - `override_json`
   - Optional JSON object with canonical bridge payload fields `meta` and `outputs`.
-  - When non-empty, `consume` skips token resolution and artifact download and uses this payload instead.
+  - When non-empty, `consume` skips artifact download and uses this payload instead. It resolves a token only when `verify: true`.
   - `meta` must satisfy the normal bridge metadata schema; `outputs` must be a JSON object with scalar values.
   - `bridge/files` restore is not supported in this mode, so `files-path` is not emitted.
 - `run_id` (defaults to triggering `workflow_run.id`)
   - Required unless the action is running under a `workflow_run` event.
+  - When it names a run other than the triggering one, `consume` reads GitHub's record of that run from the REST API (`GET /repos/{repo}/actions/runs/{run_id}`, covered by `actions:read`). The run attempt is then not checked.
   - In `override_json` mode, this binding is only checked when a run id is available from input or event context.
 - `source_workflow`
-  - Optional exact match against `meta.workflow_name`.
+  - Optional exact match against the producer run's workflow name in GitHub's record (`workflow_run.name`).
 - `expected_head_sha`
-  - Optional exact match against `meta.head_sha`.
+  - Optional exact match against `meta.head_sha`, which is self-reported by the producer.
   - Usually not needed for `workflow_run` consumers because `run_id` (and `run_attempt` when present) are already validated by default.
-  - For `pull_request` producers, this is often the synthetic merge commit SHA (`refs/pull/<n>/merge`), which changes when the base branch moves and can make this check brittle.
+  - For `pull_request*` producers, this is the synthetic merge commit SHA (`refs/pull/<n>/merge`), not `github.event.workflow_run.head_sha`. It changes when the base branch moves, which makes this check brittle.
 - `expected_pr_number`
-  - Optional exact match against `meta.pr_number`.
+  - Optional exact match against `meta.pr_number`, which is self-reported by the producer.
 - `require_event` (comma/newline-separated event names)
-  - Allowlist for `meta.event_name`.
+  - Allowlist for the event that triggered the producer run, in GitHub's record (`workflow_run.event`).
+- `untrusted_producer_events` (comma/newline-separated event names)
+  - Untrusted events whose producer runs may still expose raw artifact values. Every such value may be forged by a fork PR author (see [Producer events](#producer-events)).
+  - Only `pull_request*` events other than `pull_request_target` may be listed, and only ones that `require_event` allows. `true` is rejected.
+- `verify` (default: `false`)
+  - Fetch and check the pull request and the triggering comment or review. See [Verification](#verification).
+  - An untrusted producer run whose event isn't listed in `untrusted_producer_events` is accepted only with `verify: true`. It then exposes only `run.*` and `verified.*` values.
 - `fail_on_missing` (default: `true`)
   - `true`: missing artifact fails the action.
   - `false`: missing artifact does not fail; JSON outputs are emitted as `{}` and no per-key outputs are emitted.
@@ -188,7 +271,11 @@ Path: `consume/action.yml`
   - Applied only to direct bridge output keys from `outputs.json`.
   - Not applied to names from `extract` mappings.
 - `extract` newline-separated mappings: `NAME=source.path`
-  - Supported roots: `outputs`, `meta`, `event`.
+  - Supported roots:
+    - `outputs`, `meta`, `event`: raw artifact values.
+    - `run`: GitHub's record of the producer run. Keys are `id`, `attempt`, `event`, `workflow`, `actor`, `head_sha`, `head_branch` and `created_at`.
+    - `verified`: requires `verify: true`; see [Verification](#verification).
+  - When raw values are withheld, a mapping that reads `outputs`, `meta` or `event` fails the action, even as a fallback.
   - Every configured mapping must resolve to a scalar value or `null`; missing paths fail the action.
   - Fallback paths are supported: `a.b|c.d` (first found wins).
 - `path` restore destination for `bridge/files` (default `.bridge`)
@@ -200,24 +287,37 @@ Path: `consume/action.yml`
 - `outputs-json`
 - `meta-json`
 - `event-json`
+- `run-json`: GitHub's record of the producer run (the `run.*` root), when available.
+- `verified-json`: the `verified.*` root, with `verify: true`.
+- `producer-trust`: `trusted-workflow`, `untrusted` or `unknown` (see [Who controls the producer](#who-controls-the-producer)). Also emitted when the artifact is missing and `fail_on_missing=false`.
 - `files-path` restore destination, emitted in artifact mode (never in `override_json` mode)
   - Emitted whenever the action runs against a downloaded artifact, even when that artifact had no `bridge/files` content. In that case nothing is restored and the directory may not exist, so check for its presence before reading from it.
+
+When raw artifact values are withheld, per-key outputs, `outputs-json`, `meta-json`, `event-json` and `files-path` are not emitted, and no files are restored.
 
 When `fail_on_missing=false` and the artifact is not found, `outputs-json` is `{}`. You can skip downstream work with a guard like `if: ${{ steps.bridge.outputs.outputs-json != '{}' }}`.
 
 ## Validation Checks Performed by `consume`
 
-`consume` always validates:
-- `meta.repository` matches current repository.
-- `meta.workflow_run_id` matches requested `run_id`.
-- `meta.workflow_run_attempt` matches triggering `workflow_run.run_attempt` when available.
-  - These checks are typically sufficient to bind the artifact to the triggering workflow run.
+`consume` downloads the artifact only after checks against GitHub's record of the producer run pass:
 
-`consume` optionally validates when inputs are provided:
-- `source_workflow` -> `meta.workflow_name`
-- `expected_head_sha` -> `meta.head_sha`
-- `expected_pr_number` -> `meta.pr_number`
-- `require_event` -> `meta.event_name` membership
+1. Check the configuration: `untrusted_producer_events` entries, and the `extract` roots.
+2. Read GitHub's record of the producer run: the `workflow_run` payload, or the REST API for another `run_id`.
+3. Look up the artifact by name. This reads only GitHub's artifact metadata. If the artifact is missing, fail, or exit with empty outputs when `fail_on_missing=false`.
+4. Check the producer run:
+   - `source_workflow` -> `workflow_run.name`
+   - `require_event` -> `workflow_run.event` membership
+   - An `untrusted` run needs its event in `untrusted_producer_events`, or `verify: true`, which withholds raw values.
+5. Download and parse the artifact.
+6. Check the artifact metadata:
+   - `meta.repository` matches the current repository.
+   - `meta.workflow_run_id` matches `run_id`.
+   - `meta.workflow_run_attempt` matches the triggering `workflow_run.run_attempt`, when available.
+   - `meta.event_name` and `meta.workflow_name` match `workflow_run.event` and `workflow_run.name`.
+   - Optionally, `expected_head_sha` -> `meta.head_sha` and `expected_pr_number` -> `meta.pr_number` (both self-reported).
+7. With `verify: true`, fetch and check the pull request and trigger (see [Verification](#verification)).
+
+In `override_json` mode, steps 4 and 6 use the `workflow_run` payload when it describes `run_id`, and are otherwise limited to the metadata checks that need no GitHub record.
 
 ## Logging
 
@@ -244,7 +344,7 @@ jobs:
       - run: echo '{"lint_ok":true}' > bridge.json
       - run: echo '{"ok":true}' > lint.json
 
-      - uses: leanprover-community/privilege-escalation-bridge/emit@v1
+      - uses: leanprover-community/privilege-escalation-bridge/emit@v2
         with:
           artifact: pr-bridge
           outputs_file: bridge.json
@@ -267,23 +367,71 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      contents: write
       pull-requests: write
     steps:
       - id: bridge
-        uses: leanprover-community/privilege-escalation-bridge/consume@v1
+        uses: leanprover-community/privilege-escalation-bridge/consume@v2
         with:
           token: ${{ github.token }}
           artifact: pr-bridge
           source_workflow: PR Checks
-          expected_head_sha: ${{ github.event.workflow_run.head_sha }}
           require_event: pull_request
+          # pull_request runs are untrusted: for a fork PR, every raw value from this
+          # artifact, including meta and event fields, may be forged by the PR author.
+          # Here the lint result only goes back to the PR it came from.
+          untrusted_producer_events: pull_request
+          # Take the PR number from the API, checked against the producer run's head.
+          verify: true
           extract: |
-            pr_number=meta.pr_number
-            author=event.pull_request.user.login
+            pr_number=verified.pr.number
+            lint_ok=outputs.lint_ok
 
-      - run: echo "pr=${{ steps.bridge.outputs.pr_number }} author=${{ steps.bridge.outputs.author }}"
+      - name: Report lint result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.bridge.outputs.pr_number }}
+          LINT_OK: ${{ steps.bridge.outputs.lint_ok }}
+        run: gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body "lint_ok=${LINT_OK}"
 ```
+
+### Command From a Comment or Review
+
+The producer only has to run on the events and emit `include_event: minimal`. The consumer acts only on verified values, so it needs no `untrusted_producer_events`.
+
+```yaml
+      - id: bridge
+        uses: leanprover-community/privilege-escalation-bridge/consume@v2
+        with:
+          token: ${{ github.token }}
+          artifact: command
+          source_workflow: Commands
+          require_event: issue_comment, pull_request_review, pull_request_review_comment
+          verify: true
+          extract: |
+            author=verified.trigger.author
+            body=verified.trigger.body
+            pr_number=verified.pr.number
+
+      # Parse the command from the verified body, not from the artifact.
+      - name: Handle command
+        env:
+          BODY: ${{ steps.bridge.outputs.body }}
+          AUTHOR: ${{ steps.bridge.outputs.author }}
+          PR_NUMBER: ${{ steps.bridge.outputs.pr_number }}
+        run: ./handle-command.sh
+```
+
+## Upgrading from v1
+
+v2 changes how `consume` validates artifacts. The artifact format is unchanged (still schema v2), so artifacts from `emit@v1` are accepted. `verify: true` also needs the comment and review IDs that `emit` v2 includes.
+
+- `consume` fails for `untrusted` producer runs: every `pull_request`, `pull_request_review` and `pull_request_review_comment` run, including runs for same-repository pull requests. Either switch to `verify: true` and read `verified.*` and `run.*` values, or list the event in `untrusted_producer_events` if every bridge value is treated as untrusted.
+- `require_event` and `source_workflow` are evaluated against GitHub's record of the producer run. `meta.event_name` and `meta.workflow_name` must match that record.
+- When `run_id` names a run other than the triggering one, `consume` reads that run from the REST API, and no longer compares its attempt with the triggering run's attempt.
+- The producer run checks run before the artifact is downloaded. A missing artifact with `fail_on_missing=false` still exits cleanly.
+- `extract` rejects unknown roots.
+- New inputs `untrusted_producer_events` and `verify`; new `extract` roots `run` and `verified`; new outputs `producer-trust`, `run-json` and `verified-json`.
+- `emit`'s `include_event: minimal` now includes `comment.id` and `review.id`.
 
 ## Development
 

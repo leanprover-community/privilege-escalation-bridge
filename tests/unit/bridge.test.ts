@@ -5,14 +5,30 @@ import path from 'node:path';
 
 import {
   buildBridgeMeta,
+  classifyProducerTrust,
   getByPath,
   parseAndMergeOutputs,
   parseExtractMappings,
+  parseUntrustedProducerEvents,
   pickByPaths,
   restoreBridgeFiles,
+  runRecord,
   validateConsumerExpectations,
-  writeBridgeDirectory
+  validateExtractRoots,
+  validateUpstreamRun,
+  writeBridgeDirectory,
+  type UpstreamRun
 } from '../../src/lib/bridge.js';
+
+function upstreamRun(overrides?: Partial<UpstreamRun>): UpstreamRun {
+  return {
+    id: '123',
+    runAttempt: '1',
+    event: 'issue_comment',
+    workflowName: 'WF',
+    ...overrides
+  };
+}
 
 describe('bridge expectations', () => {
   it('validates matching consumer expectations', () => {
@@ -394,5 +410,121 @@ describe('bridge expectations', () => {
 
     expect(restored).toBe(true);
     await expect(readFile(path.join(destination, 'nested', 'payload.txt'), 'utf8')).resolves.toBe('new');
+  });
+});
+
+describe('producer trust', () => {
+  it.each([
+    ['issue_comment', 'trusted-workflow'],
+    ['push', 'trusted-workflow'],
+    ['workflow_dispatch', 'trusted-workflow'],
+    ['pull_request_target', 'trusted-workflow'],
+    // Untrusted by event alone, whether or not the PR comes from a fork.
+    ['pull_request', 'untrusted'],
+    ['pull_request_review', 'untrusted'],
+    ['pull_request_review_comment', 'untrusted'],
+    ['pull_request_some_future_event', 'untrusted']
+  ] as const)('classifies %s as %s', (event, expected) => {
+    expect(classifyProducerTrust(event)).toBe(expected);
+  });
+
+  it('decides raw access from the event, untrusted_producer_events and verify', () => {
+    const review = upstreamRun({ event: 'pull_request_review' });
+    expect(validateUpstreamRun(upstreamRun(), {})).toEqual({ trust: 'trusted-workflow', raw: true });
+    expect(validateUpstreamRun(review, { untrustedProducerEvents: ['pull_request_review'] })).toEqual({
+      trust: 'untrusted',
+      raw: true
+    });
+    // Accepted through verify, but raw artifact values are withheld.
+    expect(validateUpstreamRun(review, { verify: true })).toEqual({ trust: 'untrusted', raw: false });
+    // Listing a different event does not help.
+    expect(() => validateUpstreamRun(review, { untrustedProducerEvents: ['pull_request'] })).toThrow(
+      /Producer run 123 \(pull_request_review\) is untrusted/
+    );
+  });
+
+  it('explains what may be forged for each untrusted event', () => {
+    expect(() => validateUpstreamRun(upstreamRun({ event: 'pull_request_review' }), {})).toThrow(
+      /reviewer \(run\.actor\) is genuine, but the review body/
+    );
+    expect(() => validateUpstreamRun(upstreamRun({ event: 'pull_request' }), {})).toThrow(
+      /including meta\.pr_number, may be forged.*#producer-events/
+    );
+  });
+
+  it('checks require_event and source_workflow against the producer run', () => {
+    const run = upstreamRun({ event: 'pull_request_review', workflowName: 'Real' });
+    expect(() => validateUpstreamRun(run, { requireEvents: ['issue_comment'], verify: true })).toThrow(
+      /Source event pull_request_review is not allowed/
+    );
+    expect(() => validateUpstreamRun(run, { sourceWorkflow: 'Other', verify: true })).toThrow(/Workflow mismatch/);
+    expect(() =>
+      validateUpstreamRun(run, { requireEvents: ['pull_request_review'], sourceWorkflow: 'Real', verify: true })
+    ).not.toThrow();
+  });
+
+  it('parses untrusted_producer_events and rejects meaningless entries', () => {
+    expect(parseUntrustedProducerEvents('pull_request, pull_request_review', [])).toEqual([
+      'pull_request',
+      'pull_request_review'
+    ]);
+    expect(parseUntrustedProducerEvents('', ['issue_comment'])).toEqual([]);
+    expect(() => parseUntrustedProducerEvents('true', [])).toThrow(/takes event names, not a boolean/);
+    expect(() => parseUntrustedProducerEvents('issue_comment', [])).toThrow(/never untrusted/);
+    expect(() => parseUntrustedProducerEvents('pull_request', ['issue_comment'])).toThrow(
+      /pull_request is not allowed by require_event/
+    );
+  });
+
+  it('gates extract roots on raw access and verify', () => {
+    const mappings = (paths: string[]) => paths.map((p, i) => ({ name: `k${i}`, path: p }));
+    const raw = { raw: true, verify: true };
+    const verifiedOnly = { raw: false, verify: true };
+    expect(() => validateExtractRoots(mappings(['event.comment.user.login', 'run.actor', 'verified.pr.number']), raw)).not.toThrow();
+    expect(() => validateExtractRoots(mappings(['verified.pr.number']), { raw: true, verify: false })).toThrow(
+      /requires verify: true/
+    );
+    expect(() => validateExtractRoots(mappings(['run.actor', 'verified.trigger.body']), verifiedOnly)).not.toThrow();
+    // A raw root anywhere in a fallback chain is refused.
+    expect(() => validateExtractRoots(mappings(['verified.trigger.author|event.comment.user.login']), verifiedOnly)).toThrow(
+      /reads event\.\*, but this untrusted producer run exposes only run\.\* and verified\.\*/
+    );
+    expect(() => validateExtractRoots(mappings(['evnt.comment.id']), raw)).toThrow(/unknown root 'evnt'/);
+  });
+
+  it('builds the run.* root from GitHub\'s record', () => {
+    expect(runRecord(upstreamRun({ actor: 'alice', headSha: 'abc', headBranch: 'b', createdAt: 'now' }))).toEqual({
+      id: '123',
+      attempt: '1',
+      event: 'issue_comment',
+      workflow: 'WF',
+      actor: 'alice',
+      head_sha: 'abc',
+      head_branch: 'b',
+      created_at: 'now'
+    });
+  });
+
+  it('binds meta event_name and workflow_name to the producer run', () => {
+    const meta = buildBridgeMeta(
+      {
+        repository: 'owner/repo',
+        workflowName: 'WF',
+        runId: '123',
+        runAttempt: '1',
+        eventName: 'issue_comment',
+        headSha: 'merge-sha'
+      },
+      {}
+    );
+    const base = { repository: 'owner/repo', runId: '123', runAttempt: '1' };
+
+    expect(() => validateConsumerExpectations(meta, { ...base, upstream: upstreamRun() })).not.toThrow();
+    expect(() =>
+      validateConsumerExpectations(meta, { ...base, upstream: upstreamRun({ event: 'pull_request_review' }) })
+    ).toThrow(/Event mismatch/);
+    expect(() =>
+      validateConsumerExpectations(meta, { ...base, upstream: upstreamRun({ workflowName: 'Other' }) })
+    ).toThrow(/Workflow mismatch/);
   });
 });

@@ -16,17 +16,24 @@ inputs:
     description: Source workflow run id (defaults to triggering workflow_run.id)
     required: false
   source_workflow:
-    description: Expected source workflow name
+    description: Expected source workflow name, checked against GitHub's record of the producer run
     required: false
   expected_head_sha:
-    description: Expected source head SHA
+    description: Expected meta.head_sha (self-reported by the producer; for pull_request* events this is the PR merge commit, not workflow_run.head_sha)
     required: false
   expected_pr_number:
-    description: Expected source PR number
+    description: Expected meta.pr_number (self-reported by the producer)
     required: false
   require_event:
-    description: Comma/newline-separated allowed source event names
+    description: Comma/newline-separated allowed source event names, checked against GitHub's record of the producer run
     required: false
+  untrusted_producer_events:
+    description: Comma/newline-separated untrusted events (pull_request, pull_request_review, pull_request_review_comment) whose producer runs may still expose raw artifact values. Every such value may be forged by a fork PR author.
+    required: false
+  verify:
+    description: Fetch the pull request and the triggering comment or review from the API, check them against GitHub's record of the producer run, and expose them as verified.* values. Needs pull-requests read (and issues read for issue comments). Untrusted producer runs whose event is not in untrusted_producer_events are accepted only with verify, and then expose only run.* and verified.* values.
+    required: false
+    default: 'false'
   fail_on_missing:
     description: Whether missing artifact fails the action
     required: false
@@ -40,7 +47,7 @@ inputs:
     required: false
     default: ''
   extract:
-    description: Newline-separated mappings like NAME=source.path, where source is outputs, meta, or event
+    description: Newline-separated mappings like NAME=source.path, where source is outputs, meta, event (raw artifact values), run (GitHub's record of the producer run), or verified (requires verify)
     required: false
   path:
     description: Destination directory for restored bridge/files
@@ -51,11 +58,17 @@ inputs:
     required: false
 outputs:
   outputs-json:
-    description: JSON object of bridge outputs
+    description: JSON object of bridge outputs (not emitted when raw artifact values are withheld)
   meta-json:
-    description: JSON object of bridge metadata
+    description: JSON object of bridge metadata (not emitted when raw artifact values are withheld)
   event-json:
-    description: JSON object for meta.event
+    description: JSON object for meta.event (not emitted when raw artifact values are withheld)
+  run-json:
+    description: JSON object of GitHub's record of the producer run (the run.* extract root)
+  verified-json:
+    description: JSON object of verified pull request and trigger values (the verified.* extract root), when verify is true
+  producer-trust:
+    description: "Who controls the producer's workflow file, from GitHub's record of the run: trusted-workflow, untrusted, or unknown (override_json without a matching workflow_run payload)"
   files-path:
     description: Restore destination for bridge/files. Emitted in artifact mode (never in override_json mode), even when the artifact had no bridge/files content; in that case nothing is restored and the directory may not exist.
 runs:

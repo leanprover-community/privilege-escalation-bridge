@@ -18,9 +18,12 @@ const MINIMAL_EVENT_PATHS = [
   'issue.title',
   'issue.html_url',
   'issue.user.login',
+  // IDs let consume's verify mode re-fetch the triggering comment or review from the API.
+  'comment.id',
   'comment.body',
   'comment.path',
   'comment.user.login',
+  'review.id',
   'review.body',
   'review.state',
   'review.user.login',

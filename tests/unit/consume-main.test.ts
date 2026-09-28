@@ -17,7 +17,14 @@ const hoisted = vi.hoisted(() => {
     zipData: null as Buffer | null,
     repository: 'owner/repo',
     workflowRunId: 123,
-    workflowRunAttempt: 1
+    workflowRunAttempt: 1,
+    // The triggering workflow_run payload (GitHub's record of the producer run), if any.
+    workflowRun: undefined as Record<string, unknown> | undefined,
+    // What the REST API returns for getWorkflowRun.
+    apiWorkflowRun: {} as Record<string, unknown>,
+    // What the REST API returns for verify's lookups.
+    pulls: {} as Record<number, unknown>,
+    reviews: {} as Record<string, unknown>
   };
 
   const core = {
@@ -42,9 +49,23 @@ const hoisted = vi.hoisted(() => {
     })
   };
 
+  const found = (value: unknown) => {
+    if (value === undefined) throw Object.assign(new Error('Not Found'), { status: 404 });
+    return { data: value };
+  };
+
   const octokit = {
     rest: {
+      pulls: {
+        get: vi.fn(async ({ pull_number }: { pull_number: number }) => found(state.pulls[pull_number])),
+        getReview: vi.fn(async ({ pull_number, review_id }: { pull_number: number; review_id: number }) =>
+          found(state.reviews[`${pull_number}/${review_id}`])
+        )
+      },
       actions: {
+        getWorkflowRun: vi.fn(async () => ({
+          data: state.apiWorkflowRun
+        })),
         listWorkflowRunArtifacts: vi.fn(async () => ({
           data: {
             artifacts: state.artifacts
@@ -60,11 +81,8 @@ const hoisted = vi.hoisted(() => {
   const github = {
     context: {
       repo: { owner: 'owner', repo: 'repo' },
-      payload: {
-        workflow_run: {
-          id: state.workflowRunId,
-          run_attempt: state.workflowRunAttempt
-        }
+      get payload() {
+        return state.workflowRun ? { workflow_run: state.workflowRun } : {};
       }
     },
     getOctokit: vi.fn(() => octokit)
@@ -76,7 +94,29 @@ const hoisted = vi.hoisted(() => {
 vi.mock('@actions/core', () => hoisted.core);
 vi.mock('@actions/github', () => hoisted.github);
 
-function createBridgeZip(options?: { includeFilesDir?: boolean }): Buffer {
+const BASE_REPO_ID = 1;
+
+function workflowRunRecord(overrides?: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: hoisted.state.workflowRunId,
+    run_attempt: hoisted.state.workflowRunAttempt,
+    event: 'issue_comment',
+    name: 'WF',
+    actor: { login: 'alice' },
+    head_sha: 'head1',
+    head_branch: 'feature',
+    created_at: '2026-09-28T12:00:10Z',
+    repository: { id: BASE_REPO_ID },
+    head_repository: { id: BASE_REPO_ID },
+    ...overrides
+  };
+}
+
+function createBridgeZip(options?: {
+  includeFilesDir?: boolean;
+  eventName?: string;
+  meta?: Record<string, unknown>;
+}): Buffer {
   const zip = new AdmZip();
   zip.addFile(
     'bridge/meta.json',
@@ -87,10 +127,11 @@ function createBridgeZip(options?: { includeFilesDir?: boolean }): Buffer {
         workflow_name: 'WF',
         workflow_run_id: String(hoisted.state.workflowRunId),
         workflow_run_attempt: String(hoisted.state.workflowRunAttempt),
-        event_name: 'issue_comment',
+        event_name: options?.eventName ?? 'issue_comment',
         head_sha: 'abc',
         created_at: new Date().toISOString(),
-        event: { comment: { user: { login: 'alice' } } }
+        event: { comment: { user: { login: 'alice' } } },
+        ...options?.meta
       }),
       'utf8'
     )
@@ -119,6 +160,10 @@ describe('consume action entrypoint', () => {
     hoisted.state.failed = [];
     hoisted.state.artifacts = [{ id: 1, name: 'bridge', size_in_bytes: 123 }];
     hoisted.state.zipData = createBridgeZip();
+    hoisted.state.workflowRun = workflowRunRecord();
+    hoisted.state.apiWorkflowRun = {};
+    hoisted.state.pulls = {};
+    hoisted.state.reviews = {};
     process.env.GITHUB_REPOSITORY = hoisted.state.repository;
   });
 
@@ -238,5 +283,209 @@ describe('consume action entrypoint', () => {
 
     await expect(access(restorePath)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(hoisted.state.outputs).toContainEqual({ name: 'files-path', value: restorePath });
+  });
+
+  it('reports trusted-workflow for an issue_comment producer', async () => {
+    hoisted.state.inputs.require_event = 'issue_comment';
+
+    const { run } = await import('../../src/consume/main.js');
+    await run();
+
+    expect(hoisted.state.outputs).toContainEqual({ name: 'producer-trust', value: 'trusted-workflow' });
+    expect(hoisted.state.outputs).toContainEqual({ name: 'answer', value: '42' });
+  });
+
+  it('rejects a forged artifact from a pull_request_review run before downloading it', async () => {
+    // GitHub reports the base repository as head_repository for review events, even for fork PRs.
+    hoisted.state.workflowRun = workflowRunRecord({ event: 'pull_request_review' });
+    hoisted.state.inputs.require_event = 'issue_comment,pull_request_review';
+    hoisted.state.zipData = createBridgeZip({ eventName: 'pull_request_review' });
+
+    const { run } = await import('../../src/consume/main.js');
+    await expect(run()).rejects.toThrow(/Producer run 123 \(pull_request_review\) is untrusted/);
+    expect(hoisted.octokit.rest.actions.downloadArtifact).not.toHaveBeenCalled();
+  });
+
+  it('rejects a pull_request run even when GitHub reports a same-repository head', async () => {
+    hoisted.state.workflowRun = workflowRunRecord({ event: 'pull_request' });
+    hoisted.state.zipData = createBridgeZip({ eventName: 'pull_request' });
+
+    const { run } = await import('../../src/consume/main.js');
+    await expect(run()).rejects.toThrow(/is untrusted/);
+    expect(hoisted.octokit.rest.actions.downloadArtifact).not.toHaveBeenCalled();
+  });
+
+  it('accepts an untrusted producer listed in untrusted_producer_events and reports it', async () => {
+    hoisted.state.workflowRun = workflowRunRecord({ event: 'pull_request' });
+    hoisted.state.inputs.untrusted_producer_events = 'pull_request';
+    hoisted.state.zipData = createBridgeZip({ eventName: 'pull_request' });
+
+    const { run } = await import('../../src/consume/main.js');
+    await run();
+
+    expect(hoisted.state.outputs).toContainEqual({ name: 'producer-trust', value: 'untrusted' });
+    expect(hoisted.state.outputs).toContainEqual({ name: 'answer', value: '42' });
+  });
+
+  it('evaluates require_event against the producer run, not the artifact', async () => {
+    hoisted.state.workflowRun = workflowRunRecord({ event: 'pull_request_review' });
+    hoisted.state.booleans.verify = true;
+    hoisted.state.inputs.require_event = 'issue_comment';
+    // The artifact claims the allowed event.
+    hoisted.state.zipData = createBridgeZip({ eventName: 'issue_comment' });
+
+    const { run } = await import('../../src/consume/main.js');
+    await expect(run()).rejects.toThrow(/Source event pull_request_review is not allowed/);
+    expect(hoisted.octokit.rest.actions.downloadArtifact).not.toHaveBeenCalled();
+  });
+
+  it('fails when the artifact event does not match the producer run', async () => {
+    hoisted.state.workflowRun = workflowRunRecord({ event: 'push' });
+
+    const { run } = await import('../../src/consume/main.js');
+    await expect(run()).rejects.toThrow(
+      /Event mismatch: producer run was triggered by push, artifact claims issue_comment/
+    );
+  });
+
+  it('checks source_workflow against the producer run before downloading', async () => {
+    hoisted.state.workflowRun = workflowRunRecord({ name: 'Other' });
+    hoisted.state.inputs.source_workflow = 'WF';
+
+    const { run } = await import('../../src/consume/main.js');
+    await expect(run()).rejects.toThrow(/Workflow mismatch: expected WF, producer run belongs to Other/);
+    expect(hoisted.octokit.rest.actions.downloadArtifact).not.toHaveBeenCalled();
+  });
+
+  it('exits cleanly for a missing artifact from an untrusted producer when fail_on_missing=false', async () => {
+    hoisted.state.workflowRun = workflowRunRecord({ event: 'pull_request_review' });
+    hoisted.state.artifacts = [];
+    hoisted.state.booleans.fail_on_missing = false;
+
+    const { run } = await import('../../src/consume/main.js');
+    await run();
+
+    expect(hoisted.state.outputs).toContainEqual({ name: 'outputs-json', value: '{}' });
+    expect(hoisted.state.outputs).toContainEqual({ name: 'producer-trust', value: 'untrusted' });
+  });
+
+  it('looks up the producer run via the API when run_id is not the triggering run', async () => {
+    hoisted.state.workflowRun = undefined;
+    // The API reports the latest attempt, so it is not used for the attempt binding.
+    hoisted.state.apiWorkflowRun = workflowRunRecord({ run_attempt: 5 });
+
+    const { run } = await import('../../src/consume/main.js');
+    await run();
+
+    expect(hoisted.octokit.rest.actions.getWorkflowRun).toHaveBeenCalledWith(
+      expect.objectContaining({ run_id: hoisted.state.workflowRunId })
+    );
+    expect(hoisted.state.outputs).toContainEqual({ name: 'producer-trust', value: 'trusted-workflow' });
+  });
+
+  it('reports unknown producer trust for override_json without a triggering run', async () => {
+    hoisted.state.workflowRun = undefined;
+    hoisted.state.inputs = {
+      override_json: JSON.stringify({
+        meta: {
+          schema_version: 2,
+          repository: hoisted.state.repository,
+          workflow_name: 'WF',
+          workflow_run_id: '1',
+          workflow_run_attempt: '1',
+          event_name: 'issue_comment',
+          head_sha: 'abc',
+          created_at: new Date().toISOString()
+        },
+        outputs: { answer: '42' }
+      }),
+      path: ''
+    };
+
+    const { run } = await import('../../src/consume/main.js');
+    await run();
+
+    expect(hoisted.github.getOctokit).not.toHaveBeenCalled();
+    expect(hoisted.state.outputs).toContainEqual({ name: 'producer-trust', value: 'unknown' });
+  });
+
+  it('accepts an untrusted producer through verify and exposes only run.* and verified.* values', async () => {
+    const destination = path.join(await mkdtemp(path.join(os.tmpdir(), 'consume-main-')), 'restore');
+    hoisted.state.inputs.path = destination;
+    hoisted.state.workflowRun = workflowRunRecord({ event: 'pull_request_review' });
+    hoisted.state.booleans.verify = true;
+    hoisted.state.inputs.extract = 'reviewer=verified.trigger.author\npr=verified.pr.number\nactor=run.actor';
+    hoisted.state.zipData = createBridgeZip({
+      eventName: 'pull_request_review',
+      includeFilesDir: true,
+      meta: { pr_number: 7, event: { review: { id: 22, user: { login: 'forged' } } } }
+    });
+    hoisted.state.reviews = {
+      '7/22': {
+        id: 22,
+        user: { login: 'alice', type: 'User' },
+        body: 'maintainer merge',
+        state: 'APPROVED',
+        html_url: 'https://github.com/owner/repo/pull/7#pullrequestreview-22',
+        submitted_at: '2026-09-28T12:00:07Z'
+      }
+    };
+    hoisted.state.pulls = {
+      7: {
+        number: 7,
+        title: 'T',
+        html_url: 'https://github.com/owner/repo/pull/7',
+        user: { login: 'bob' },
+        state: 'open',
+        merged: false,
+        head: { sha: 'head1', ref: 'feature', repo: { id: 2, full_name: 'bob/repo' } },
+        base: { ref: 'main', repo: { id: BASE_REPO_ID } }
+      }
+    };
+
+    const { run } = await import('../../src/consume/main.js');
+    await run();
+
+    const names = hoisted.state.outputs.map((o) => o.name);
+    expect(hoisted.state.outputs).toContainEqual({ name: 'reviewer', value: 'alice' });
+    expect(hoisted.state.outputs).toContainEqual({ name: 'pr', value: '7' });
+    expect(hoisted.state.outputs).toContainEqual({ name: 'actor', value: 'alice' });
+    expect(hoisted.state.outputs).toContainEqual({ name: 'producer-trust', value: 'untrusted' });
+    expect(names).toContain('run-json');
+    expect(names).toContain('verified-json');
+    // No raw artifact values: per-key outputs, raw JSON outputs and files are all withheld.
+    for (const raw of ['answer', 'outputs-json', 'meta-json', 'event-json', 'files-path']) {
+      expect(names).not.toContain(raw);
+    }
+    await expect(access(destination)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('refuses raw extract roots for an untrusted producer accepted through verify', async () => {
+    hoisted.state.workflowRun = workflowRunRecord({ event: 'pull_request_review' });
+    hoisted.state.booleans.verify = true;
+    hoisted.state.inputs.extract = 'reviewer=event.review.user.login';
+
+    const { run } = await import('../../src/consume/main.js');
+    await expect(run()).rejects.toThrow(/exposes only run\.\* and verified\.\* values/);
+    expect(hoisted.octokit.rest.actions.downloadArtifact).not.toHaveBeenCalled();
+  });
+
+  it('rejects a boolean untrusted_producer_events before any API call', async () => {
+    hoisted.state.inputs.untrusted_producer_events = 'true';
+
+    const { run } = await import('../../src/consume/main.js');
+    await expect(run()).rejects.toThrow(/takes event names, not a boolean/);
+    expect(hoisted.github.getOctokit).not.toHaveBeenCalled();
+  });
+
+  it('emits run-json when the artifact is missing', async () => {
+    hoisted.state.artifacts = [];
+    hoisted.state.booleans.fail_on_missing = false;
+
+    const { run } = await import('../../src/consume/main.js');
+    await run();
+
+    const runJson = hoisted.state.outputs.find((o) => o.name === 'run-json')?.value;
+    expect(JSON.parse(runJson ?? '{}')).toMatchObject({ id: '123', event: 'issue_comment', actor: 'alice' });
   });
 });
