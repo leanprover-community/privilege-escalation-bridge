@@ -9,7 +9,7 @@ inputs:
     description: Deprecated alias for token. Token with actions:read for downloading artifacts
     required: false
   artifact:
-    description: Artifact name
+    description: Artifact name. Exactly one artifact with this name must have been uploaded during the producer run's attempt.
     required: false
     default: bridge
   run_id:

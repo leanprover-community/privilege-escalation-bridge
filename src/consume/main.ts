@@ -22,6 +22,7 @@ import {
   readBridgeDirectory,
   restoreBridgeFiles,
   runRecord,
+  selectAttemptArtifact,
   validateConsumerExpectations,
   validateExtractRoots,
   validateUpstreamRun,
@@ -51,6 +52,7 @@ interface WorkflowRunRecord {
   head_sha?: string;
   head_branch?: string | null;
   created_at?: string;
+  run_started_at?: string;
 }
 
 function parseExposeMode(): 'outputs' | 'env' | 'both' {
@@ -85,7 +87,8 @@ function toUpstreamRun(record: WorkflowRunRecord, fromPayload: boolean): Upstrea
     actor: record.actor?.login,
     headSha: record.head_sha,
     headBranch: record.head_branch ?? undefined,
-    createdAt: record.created_at
+    createdAt: record.created_at,
+    attemptStartedAt: record.run_started_at
   };
 }
 
@@ -111,37 +114,35 @@ async function findBridgeArtifact(
   logger: Logger,
   octokit: Octokit,
   repository: string,
-  runId: number,
+  upstream: UpstreamRun,
   artifactName: string,
   failOnMissing: boolean
 ): Promise<{ id: number; name: string } | null> {
   const [owner, repo] = repository.split('/');
-  const artifactsResp = await octokit.rest.actions.listWorkflowRunArtifacts({
+  const artifacts = await octokit.paginate(octokit.rest.actions.listWorkflowRunArtifacts, {
     owner,
     repo,
-    run_id: runId,
+    run_id: Number(upstream.id),
     name: artifactName,
     per_page: 100
   });
-  logger.info(
-    `Found ${artifactsResp.data.artifacts.length} artifact(s) named '${artifactName}' on source run.`
-  );
+  logger.info(`Found ${artifacts.length} artifact(s) named '${artifactName}' on source run.`);
   debugJson(
     logger,
     'source artifacts',
-    artifactsResp.data.artifacts.map((a) => ({ id: a.id, name: a.name, size_in_bytes: a.size_in_bytes }))
+    artifacts.map((a) => ({ id: a.id, name: a.name, size_in_bytes: a.size_in_bytes, created_at: a.created_at }))
   );
 
-  const artifactInfo = artifactsResp.data.artifacts.find((a) => a.name === artifactName);
+  const artifactInfo = selectAttemptArtifact(artifacts, artifactName, upstream);
 
   if (!artifactInfo) {
     if (failOnMissing) {
-      throw new Error(`Artifact ${artifactName} was not found for run ${runId}`);
+      throw new Error(`Artifact ${artifactName} was not found for run ${upstream.id}`);
     }
     logger.warning(`Artifact '${artifactName}' not found; continuing because fail_on_missing=false.`);
     return null;
   }
-  logger.info(`Selected artifact '${artifactInfo.name}' (id=${artifactInfo.id}).`);
+  logger.info(`Selected artifact '${artifactInfo.name}' (id=${artifactInfo.id}), uploaded during the producer run's attempt.`);
   return { id: artifactInfo.id, name: artifactInfo.name };
 }
 
@@ -305,12 +306,16 @@ export async function run(): Promise<void> {
     if (runJson) core.setOutput('run-json', JSON.stringify(runJson));
   };
 
-  // Order matters: look the artifact up (GitHub metadata only), then run the checks that need only
-  // GitHub's record of the producer run, and only then download and parse producer-written bytes.
+  // Order matters: pick the artifact of the producer run's attempt (GitHub metadata only), then run
+  // the checks that need only GitHub's record of the producer run, and only then download and parse
+  // producer-written bytes.
   let artifactInfo: { id: number; name: string } | null = null;
   if (!overrideEnabled) {
+    // Artifact mode always has a token and a run id, so this holds unless GitHub returned no record.
+    if (!upstream) throw new Error(`GitHub's record of run ${runId} is not available`);
+    const producerRun = upstream;
     artifactInfo = await logger.withGroup('Bridge Consume: Find Artifact', () =>
-      findBridgeArtifact(logger, octokit as Octokit, repository, runId, artifactName, failOnMissing)
+      findBridgeArtifact(logger, octokit as Octokit, repository, producerRun, artifactName, failOnMissing)
     );
     if (!artifactInfo) {
       core.info('Bridge artifact not found and fail_on_missing=false; exiting without outputs.');

@@ -131,6 +131,7 @@ describe('verifyProducerRun', () => {
     const octokit = fakeOctokit({ issueComments: { 11: issueComment() } });
     const verified = await verifyProducerRun(octokit, REPO, upstream('issue_comment'), meta({ event: { comment: { id: 11 } } }));
     expect(verified.trigger?.id).toBe(11);
+    expect(verified.trigger).not.toHaveProperty('commit_id');
     expect(verified.pr).toBeUndefined();
   });
 
@@ -170,7 +171,14 @@ describe('verifyProducerRun', () => {
     };
     const octokit = fakeOctokit({ reviews: { '7/22': review }, pulls: { 7: PR_7 } });
     const verified = await verifyProducerRun(octokit, REPO, upstream('pull_request_review'), meta({ event: { review: { id: 22 } } }));
-    expect(verified.trigger).toMatchObject({ kind: 'review', id: 22, state: 'APPROVED', author: 'alice' });
+    expect(verified.trigger).toMatchObject({
+      kind: 'review',
+      id: 22,
+      state: 'APPROVED',
+      author: 'alice',
+      commit_id: 'older-commit'
+    });
+    expect(verified.trigger).not.toHaveProperty('original_commit_id');
     expect(verified.pr?.number).toBe(7);
 
     // A forged PR number does not find the review.
@@ -187,6 +195,9 @@ describe('verifyProducerRun', () => {
       path: 'src/a.ts',
       html_url: 'https://github.com/owner/repo/pull/7#discussion_r33',
       pull_request_url: 'https://api.github.com/repos/owner/repo/pulls/7',
+      // GitHub moves commit_id forward with later pushes; original_commit_id stays put.
+      commit_id: 'head1',
+      original_commit_id: 'drafted-on',
       // Drafted in a pending review, published when the review was submitted.
       created_at: '2026-09-27T10:00:00Z',
       updated_at: '2026-09-28T12:00:05Z'
@@ -198,7 +209,13 @@ describe('verifyProducerRun', () => {
       upstream('pull_request_review_comment'),
       meta({ event: { comment: { id: 33 } } })
     );
-    expect(verified.trigger).toMatchObject({ kind: 'review_comment', id: 33, path: 'src/a.ts' });
+    expect(verified.trigger).toMatchObject({
+      kind: 'review_comment',
+      id: 33,
+      path: 'src/a.ts',
+      commit_id: 'head1',
+      original_commit_id: 'drafted-on'
+    });
 
     await expect(
       verifyProducerRun(octokit, REPO, upstream('pull_request_review_comment'), meta({ pr_number: 8, event: { comment: { id: 33 } } }))
