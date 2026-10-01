@@ -39335,6 +39335,18 @@ async function listFilesRecursively(dir) {
 
 
 
+const PRODUCER_EVENTS_DOCS = 'https://github.com/leanprover-community/privilege-escalation-bridge#producer-events';
+const RAW_EXTRACT_ROOTS = ['outputs', 'meta', 'event'];
+const EXTRACT_ROOTS = [...RAW_EXTRACT_ROOTS, 'run', 'verified'];
+// What a consumer must keep in mind for each untrusted event, shown when it is rejected.
+const UNTRUSTED_EVENT_RISKS = {
+    pull_request: "GitHub runs this event's workflow file from the pull request, so for a fork PR every artifact " +
+        'value, including meta.pr_number, may be forged',
+    pull_request_review: "GitHub runs this event's workflow file from the pull request, which may come from a fork. The " +
+        'reviewer (run.actor) is genuine, but the review body, event fields and PR number in the artifact may be forged',
+    pull_request_review_comment: "GitHub runs this event's workflow file from the pull request, which may come from a fork. The " +
+        'commenter (run.actor) is genuine, but the comment body, event fields and PR number in the artifact may be forged'
+};
 function buildBridgeMeta(producer, extraMeta) {
     return {
         schema_version: SCHEMA_VERSION,
@@ -39403,6 +39415,103 @@ async function restoreBridgeFiles(filesDir, destination) {
     await (0,promises_namespaceObject.cp)(filesDir, destination, { recursive: true, force: true });
     return true;
 }
+/**
+ * Classifies who controls the producer's workflow file, from the event in GitHub's record of the run.
+ *
+ * For `pull_request*` events other than `pull_request_target`, GitHub runs the workflow file from the
+ * pull request's merge ref, so when the PR comes from a fork its author controls the whole producer
+ * job and can write any artifact they like. This depends on the event alone, not on whether a given
+ * PR is a fork, so a consumer behaves the same for every run of an event (and GitHub's
+ * head_repository is wrong for review events anyway). `trusted-workflow` means only the workflow
+ * file is trusted: artifact contents may still carry PR-derived data.
+ */
+function classifyProducerTrust(event) {
+    return event.startsWith('pull_request') && event !== 'pull_request_target' ? 'untrusted' : 'trusted-workflow';
+}
+function parseUntrustedProducerEvents(raw, requireEvents) {
+    const events = parsePathList(raw);
+    for (const event of events) {
+        if (event === 'true' || event === 'false') {
+            throw new Error('untrusted_producer_events takes event names, not a boolean: list the events whose untrusted runs ' +
+                `may expose raw artifact values, for example pull_request. See ${PRODUCER_EVENTS_DOCS}`);
+        }
+        if (classifyProducerTrust(event) !== 'untrusted') {
+            throw new Error(`untrusted_producer_events: ${event} producer runs are never untrusted, so listing it has no effect`);
+        }
+        if (requireEvents.length > 0 && !requireEvents.includes(event)) {
+            throw new Error(`untrusted_producer_events: ${event} is not allowed by require_event`);
+        }
+    }
+    return events;
+}
+/**
+ * Checks that need only GitHub's record of the producer run, so they can run before download.
+ * Returns whether raw artifact values may be exposed: an untrusted run needs its event listed in
+ * untrusted_producer_events for that, and otherwise is accepted only with verify, exposing run.* and
+ * verified.* values alone.
+ */
+function validateUpstreamRun(run, expectations) {
+    if (expectations.sourceWorkflow && run.workflowName !== expectations.sourceWorkflow) {
+        throw new Error(`Workflow mismatch: expected ${expectations.sourceWorkflow}, producer run belongs to ${run.workflowName}`);
+    }
+    if (expectations.requireEvents &&
+        expectations.requireEvents.length > 0 &&
+        !expectations.requireEvents.includes(run.event)) {
+        throw new Error(`Source event ${run.event} is not allowed`);
+    }
+    const trust = classifyProducerTrust(run.event);
+    if (trust === 'trusted-workflow' || expectations.untrustedProducerEvents?.includes(run.event)) {
+        return { trust, raw: true };
+    }
+    if (expectations.verify) {
+        return { trust, raw: false };
+    }
+    const risk = UNTRUSTED_EVENT_RISKS[run.event] ??
+        "GitHub runs this event's workflow file from the pull request, so for a fork PR every artifact value may be forged";
+    throw new Error(`Producer run ${run.id} (${run.event}) is untrusted. ${risk}. Set verify: true and read run.* and ` +
+        `verified.* values, or add ${run.event} to untrusted_producer_events if every bridge value is ` +
+        `treated as untrusted. See ${PRODUCER_EVENTS_DOCS}`);
+}
+/**
+ * Checks the roots of extract mappings: every root must exist, verified.* needs verify, and when raw
+ * values are withheld (an untrusted producer accepted through verify), outputs.*, meta.* and event.*
+ * are refused rather than silently resolved.
+ */
+function validateExtractRoots(mappings, access) {
+    for (const mapping of mappings) {
+        const roots = mapping.path
+            .split('|')
+            .map((candidate) => candidate.split('.')[0].trim())
+            .filter(Boolean);
+        for (const root of roots) {
+            if (!EXTRACT_ROOTS.includes(root)) {
+                throw new Error(`Extract mapping '${mapping.name}' uses unknown root '${root}'; use ${EXTRACT_ROOTS.join(', ')}`);
+            }
+            if (root === 'verified' && !access.verify) {
+                throw new Error(`Extract mapping '${mapping.name}' reads verified.*, which requires verify: true`);
+            }
+            if (!access.raw && RAW_EXTRACT_ROOTS.includes(root)) {
+                throw new Error(`Extract mapping '${mapping.name}' reads ${root}.*, but this untrusted producer run exposes only ` +
+                    'run.* and verified.* values. Read those instead, or list the event in untrusted_producer_events.');
+            }
+        }
+    }
+}
+/** The run.* extract root: GitHub's record of the producer run. */
+function runRecord(run) {
+    const record = { id: run.id, event: run.event, workflow: run.workflowName };
+    if (run.runAttempt)
+        record.attempt = run.runAttempt;
+    if (run.actor)
+        record.actor = run.actor;
+    if (run.headSha)
+        record.head_sha = run.headSha;
+    if (run.headBranch)
+        record.head_branch = run.headBranch;
+    if (run.createdAt)
+        record.created_at = run.createdAt;
+    return record;
+}
 function validateConsumerExpectations(meta, expectations) {
     if (meta.repository !== expectations.repository) {
         throw new Error(`Repository mismatch: expected ${expectations.repository}, got ${meta.repository}`);
@@ -39412,6 +39521,18 @@ function validateConsumerExpectations(meta, expectations) {
     }
     if (expectations.runId && expectations.runAttempt && meta.workflow_run_attempt !== expectations.runAttempt) {
         throw new Error(`Run attempt mismatch: expected ${expectations.runAttempt}, got ${meta.workflow_run_attempt}`);
+    }
+    // Bind the self-reported event and workflow name to GitHub's record, so the source_workflow and
+    // require_event checks below (and any consumer reading meta.event_name / meta.workflow_name)
+    // see values the producer cannot forge. head_sha is not bound: emit records GITHUB_SHA, which is
+    // the PR merge commit for pull_request* events, while GitHub records the PR head commit.
+    if (expectations.upstream) {
+        if (meta.event_name !== expectations.upstream.event) {
+            throw new Error(`Event mismatch: producer run was triggered by ${expectations.upstream.event}, artifact claims ${meta.event_name}`);
+        }
+        if (meta.workflow_name !== expectations.upstream.workflowName) {
+            throw new Error(`Workflow mismatch: producer run belongs to ${expectations.upstream.workflowName}, artifact claims ${meta.workflow_name}`);
+        }
     }
     if (expectations.sourceWorkflow && meta.workflow_name !== expectations.sourceWorkflow) {
         throw new Error(`Workflow mismatch: expected ${expectations.sourceWorkflow}, got ${meta.workflow_name}`);
@@ -39571,7 +39692,188 @@ function resolveAuthToken(sources) {
         'Provide `with: token: ${{ github.token }}` (or equivalent token with actions:read).');
 }
 
+;// CONCATENATED MODULE: ./src/consume/verify.ts
+
+/**
+ * How long before the producer run's creation the triggering object may have last changed. Across a
+ * year of mathlib4 review runs, the longest real gap between a review and its run was 84 minutes, so
+ * this only rejects replays of old objects, not delayed runs.
+ */
+const VERIFY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+function hintId(value, what, howToEmit) {
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0)
+        return value;
+    throw new Error(`verify: the artifact has no ${what}. ${howToEmit}`);
+}
+const EMIT_IDS_HINT = 'Emit it with include_event: minimal from emit v2, or list comment.id and review.id in event_fields.';
+function prNumberHint(meta) {
+    return hintId(meta.pr_number, 'meta.pr_number', 'emit records it for pull request events.');
+}
+function numberFromUrl(url) {
+    const match = /\/(\d+)$/.exec(url);
+    if (!match)
+        throw new Error(`verify: cannot read an issue or pull request number from ${url}`);
+    return Number(match[1]);
+}
+function isNotFound(error) {
+    return error.status === 404;
+}
+function checkAuthor(user, run, what) {
+    if (!user || user.login !== run.actor) {
+        throw new Error(`verify: ${what} was written by ${user?.login ?? 'a deleted user'}, but the producer run was triggered by ${run.actor}`);
+    }
+    return user;
+}
+// The object must have been written no later than the run was created (so a producer cannot wait
+// for the actor's next comment and claim it), and last changed at most VERIFY_MAX_AGE_MS before
+// (so it cannot claim an old one). Using the last change covers edits and inline comments that were
+// drafted before their review was submitted.
+function checkTiming(what, createdAt, lastModifiedAt, run) {
+    const runCreated = Date.parse(run.createdAt);
+    if (Date.parse(createdAt) > runCreated) {
+        throw new Error(`verify: ${what} was written after the producer run was created`);
+    }
+    if (Date.parse(lastModifiedAt) < runCreated - VERIFY_MAX_AGE_MS) {
+        throw new Error(`verify: ${what} last changed more than 24 hours before the producer run was created`);
+    }
+}
+function checkPrHint(meta, number, what) {
+    if (meta.pr_number !== undefined && meta.pr_number !== number) {
+        throw new Error(`verify: ${what} belongs to #${number}, but the artifact names #${String(meta.pr_number)}`);
+    }
+}
+async function fetchPullRequest(octokit, owner, repo, number) {
+    const { data } = await octokit.rest.pulls.get({ owner, repo, pull_number: number });
+    return {
+        number: data.number,
+        title: data.title,
+        url: data.html_url,
+        author: data.user?.login ?? '',
+        state: data.state,
+        merged: data.merged,
+        head_sha: data.head.sha,
+        head_ref: data.head.ref,
+        head_repo: data.head.repo?.full_name ?? null,
+        is_fork: !data.head.repo || data.head.repo.id !== data.base.repo.id,
+        base_ref: data.base.ref
+    };
+}
+function trigger(kind, id, user, fields) {
+    return {
+        kind,
+        id,
+        author: user.login,
+        author_type: user.type ?? '',
+        body: fields.body ?? '',
+        url: fields.url,
+        created_at: fields.created_at,
+        updated_at: fields.updated_at,
+        ...(fields.path !== undefined ? { path: fields.path } : {}),
+        ...(fields.state !== undefined ? { state: fields.state } : {})
+    };
+}
+/**
+ * Fetches the pull request and the triggering comment or review from the API, using the artifact
+ * only for hints (PR number, comment or review id), and binds them to GitHub's record of the run.
+ */
+async function verifyProducerRun(octokit, repository, run, meta) {
+    if (!run.actor || !run.headSha || !run.createdAt) {
+        throw new Error(`verify: GitHub's record of run ${run.id} has no actor, head SHA or creation time`);
+    }
+    const [owner, repo] = repository.split('/');
+    const event = meta.event ?? {};
+    switch (run.event) {
+        case 'pull_request': {
+            const number = prNumberHint(meta);
+            const pr = await fetchPullRequest(octokit, owner, repo, number);
+            if (pr.head_sha !== run.headSha) {
+                throw new Error(`verify: PR #${number} is at ${pr.head_sha}, not the producer run's ${run.headSha}. ` +
+                    'Either the PR changed after the run (a newer run will follow), or the PR number is forged.');
+            }
+            return { pr };
+        }
+        case 'issue_comment': {
+            const id = hintId(getByPath(event, 'comment.id'), 'event.comment.id', EMIT_IDS_HINT);
+            const { data } = await octokit.rest.issues.getComment({ owner, repo, comment_id: id });
+            const user = checkAuthor(data.user, run, `comment ${id}`);
+            checkTiming(`comment ${id}`, data.created_at, data.updated_at, run);
+            const number = numberFromUrl(data.issue_url);
+            checkPrHint(meta, number, `comment ${id}`);
+            let pr;
+            try {
+                pr = await fetchPullRequest(octokit, owner, repo, number);
+            }
+            catch (error) {
+                // Comments on plain issues have no pull request.
+                if (!isNotFound(error))
+                    throw error;
+            }
+            return {
+                trigger: trigger('issue_comment', id, user, {
+                    body: data.body,
+                    url: data.html_url,
+                    created_at: data.created_at,
+                    updated_at: data.updated_at
+                }),
+                ...(pr ? { pr } : {})
+            };
+        }
+        case 'pull_request_review': {
+            const id = hintId(getByPath(event, 'review.id'), 'event.review.id', EMIT_IDS_HINT);
+            const number = prNumberHint(meta);
+            let data;
+            try {
+                // The endpoint is scoped to the PR, so a forged PR number does not find the review.
+                ({ data } = await octokit.rest.pulls.getReview({ owner, repo, pull_number: number, review_id: id }));
+            }
+            catch (error) {
+                if (isNotFound(error)) {
+                    throw new Error(`verify: review ${id} was not found on PR #${number}, or the token cannot read pull requests`);
+                }
+                throw error;
+            }
+            if (!data.submitted_at) {
+                throw new Error(`verify: review ${id} has not been submitted`);
+            }
+            const user = checkAuthor(data.user, run, `review ${id}`);
+            // Reviews expose no edit time, so both bounds use submission.
+            checkTiming(`review ${id}`, data.submitted_at, data.submitted_at, run);
+            return {
+                trigger: trigger('review', id, user, {
+                    body: data.body,
+                    url: data.html_url,
+                    created_at: data.submitted_at,
+                    updated_at: data.submitted_at,
+                    state: data.state
+                }),
+                pr: await fetchPullRequest(octokit, owner, repo, number)
+            };
+        }
+        case 'pull_request_review_comment': {
+            const id = hintId(getByPath(event, 'comment.id'), 'event.comment.id', EMIT_IDS_HINT);
+            const { data } = await octokit.rest.pulls.getReviewComment({ owner, repo, comment_id: id });
+            const user = checkAuthor(data.user, run, `review comment ${id}`);
+            checkTiming(`review comment ${id}`, data.created_at, data.updated_at, run);
+            const number = numberFromUrl(data.pull_request_url);
+            checkPrHint(meta, number, `review comment ${id}`);
+            return {
+                trigger: trigger('review_comment', id, user, {
+                    body: data.body,
+                    url: data.html_url,
+                    created_at: data.created_at,
+                    updated_at: data.updated_at,
+                    path: data.path
+                }),
+                pr: await fetchPullRequest(octokit, owner, repo, number)
+            };
+        }
+        default:
+            throw new Error(`verify: true is not supported for ${run.event} producer runs`);
+    }
+}
+
 ;// CONCATENATED MODULE: ./src/consume/main.ts
+
 
 
 
@@ -39597,9 +39899,41 @@ function writeMaybeOutput(name, value, expose) {
         exportVariable(name, value);
     }
 }
-async function downloadBridgeArtifact(logger, token, repository, runId, artifactName, failOnMissing) {
+function toUpstreamRun(record, fromPayload) {
+    if (typeof record.event !== 'string' || !record.event) {
+        throw new Error(`GitHub's record of run ${record.id} has no event`);
+    }
+    if (typeof record.name !== 'string' || !record.name) {
+        throw new Error(`GitHub's record of run ${record.id} has no workflow name`);
+    }
+    return {
+        id: String(record.id),
+        runAttempt: fromPayload && record.run_attempt ? String(record.run_attempt) : undefined,
+        event: record.event,
+        workflowName: record.name,
+        actor: record.actor?.login,
+        headSha: record.head_sha,
+        headBranch: record.head_branch ?? undefined,
+        createdAt: record.created_at
+    };
+}
+// GitHub's record of the producer run: the triggering workflow_run payload when it describes runId,
+// otherwise the REST API (when a token is available).
+async function resolveUpstreamRun(octokit, repository, runId) {
+    if (!runId)
+        return undefined;
+    const triggering = github_context.payload.workflow_run;
+    if (triggering && String(triggering.id) === String(runId)) {
+        return toUpstreamRun(triggering, true);
+    }
+    if (!octokit)
+        return undefined;
     const [owner, repo] = repository.split('/');
-    const octokit = getOctokit(token);
+    const { data } = await octokit.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
+    return toUpstreamRun(data, false);
+}
+async function findBridgeArtifact(logger, octokit, repository, runId, artifactName, failOnMissing) {
+    const [owner, repo] = repository.split('/');
     const artifactsResp = await octokit.rest.actions.listWorkflowRunArtifacts({
         owner,
         repo,
@@ -39618,10 +39952,14 @@ async function downloadBridgeArtifact(logger, token, repository, runId, artifact
         return null;
     }
     logger.info(`Selected artifact '${artifactInfo.name}' (id=${artifactInfo.id}).`);
+    return { id: artifactInfo.id, name: artifactInfo.name };
+}
+async function downloadBridgeArtifact(logger, octokit, repository, artifactId) {
+    const [owner, repo] = repository.split('/');
     const zipResp = await octokit.rest.actions.downloadArtifact({
         owner,
         repo,
-        artifact_id: artifactInfo.id,
+        artifact_id: artifactId,
         archive_format: 'zip'
     });
     const zipBuffer = Buffer.from(zipResp.data);
@@ -39638,21 +39976,21 @@ async function downloadBridgeArtifact(logger, token, repository, runId, artifact
         tempDir
     };
 }
-function validateExpectations(meta, runId) {
+function validateExpectations(meta, runId, upstream) {
     const expectedRepository = process.env.GITHUB_REPOSITORY || `${github_context.repo.owner}/${github_context.repo.repo}`;
     const sourceWorkflow = getInput('source_workflow');
     const expectedHeadSha = getInput('expected_head_sha');
     const expectedPrNumber = getInput('expected_pr_number');
     const requireEvent = parsePathList(getInput('require_event'));
-    const triggerAttempt = github_context.payload.workflow_run?.run_attempt;
     validateConsumerExpectations(meta, {
         repository: expectedRepository,
         runId: runId ? String(runId) : undefined,
-        runAttempt: runId && triggerAttempt ? String(triggerAttempt) : undefined,
+        runAttempt: runId ? upstream?.runAttempt : undefined,
         sourceWorkflow: sourceWorkflow || undefined,
         expectedHeadSha: expectedHeadSha || undefined,
         expectedPrNumber: expectedPrNumber || undefined,
-        requireEvents: requireEvent
+        requireEvents: requireEvent,
+        upstream
     });
 }
 function loadOverrideBridge(logger, raw) {
@@ -39675,14 +40013,10 @@ function loadOverrideBridge(logger, raw) {
         outputs
     };
 }
-function emitExtractedValues(outputs, meta, expose) {
-    const extractRaw = getInput('extract');
-    if (!extractRaw.trim())
-        return [];
-    const mappings = parseExtractMappings(extractRaw);
+function emitExtractedValues(mappings, roots, expose) {
     const extractedKeys = [];
     for (const mapping of mappings) {
-        const value = getByPath({ outputs, meta, event: meta.event || {} }, mapping.path);
+        const value = getByPath(roots, mapping.path);
         if (value === undefined) {
             throw new Error(`Missing extracted value for '${mapping.name}' at path '${mapping.path}'`);
         }
@@ -39699,36 +40033,41 @@ async function run() {
     const artifactName = getInput('artifact') || 'bridge';
     const runId = Number(getInput('run_id') || github_context.payload.workflow_run?.id);
     const failOnMissing = getBooleanInput('fail_on_missing', { required: false });
+    const verify = getBooleanInput('verify', { required: false });
     const expose = parseExposeMode();
     const prefix = getInput('prefix') || '';
     const destination = external_node_path_default().resolve(getInput('path') || '.bridge');
     const repository = process.env.GITHUB_REPOSITORY || `${github_context.repo.owner}/${github_context.repo.repo}`;
+    const sourceWorkflow = getInput('source_workflow') || undefined;
+    const requireEvents = parsePathList(getInput('require_event'));
+    const untrustedProducerEvents = parseUntrustedProducerEvents(getInput('untrusted_producer_events'), requireEvents);
+    const mappings = parseExtractMappings(getInput('extract'));
+    validateExtractRoots(mappings, { raw: true, verify });
     await logger.withGroup('Bridge Consume: Inputs', () => {
         logger.info(`Source mode: ${overrideEnabled ? 'override_json' : 'artifact'}`);
         logger.info(`Artifact name: ${artifactName}`);
         logger.info(`Source run id: ${String(runId || '(unset)')}`);
+        logger.info(`Verify: ${String(verify)}`);
         logger.info(`Expose mode: ${expose}`);
         logger.info(`Output prefix: ${prefix || '(none)'}`);
         logger.info(`Restore path: ${destination}`);
         if (logger.debugEnabled) {
             logger.debug(`Repository: ${repository}`);
             logger.debug(`fail_on_missing: ${String(failOnMissing)}`);
-            logger.debug(`source_workflow: ${getInput('source_workflow') || '(none)'}`);
+            logger.debug(`source_workflow: ${sourceWorkflow || '(none)'}`);
             logger.debug(`expected_head_sha: ${getInput('expected_head_sha') || '(none)'}`);
             logger.debug(`expected_pr_number: ${getInput('expected_pr_number') || '(none)'}`);
-            logger.debug(`require_event: ${getInput('require_event') || '(none)'}`);
-            logger.debug(`extract mappings provided: ${getInput('extract') ? 'yes' : 'no'}`);
+            logger.debug(`require_event: ${requireEvents.join(',') || '(none)'}`);
+            logger.debug(`untrusted_producer_events: ${untrustedProducerEvents.join(',') || '(none)'}`);
+            logger.debug(`extract mappings provided: ${mappings.length > 0 ? 'yes' : 'no'}`);
             logger.debug(`override_json provided: ${overrideEnabled ? 'yes' : 'no'}`);
         }
     });
     if (!overrideEnabled && (!runId || Number.isNaN(runId))) {
         throw new Error('run_id is required (or action must run from workflow_run event)');
     }
-    let bridge;
-    if (overrideEnabled) {
-        bridge = await logger.withGroup('Bridge Consume: Load Override', () => Promise.resolve(loadOverrideBridge(logger, overrideJson)));
-    }
-    else {
+    let octokit;
+    if (!overrideEnabled || verify) {
         const token = resolveAuthToken({
             tokenInput: getInput('token'),
             githubTokenInput: getInput('github_token'),
@@ -39736,20 +40075,75 @@ async function run() {
             envGhToken: process.env.GH_TOKEN
         });
         core_setSecret(token);
-        bridge = await logger.withGroup('Bridge Consume: Download Artifact', () => downloadBridgeArtifact(logger, token, repository, runId, artifactName, failOnMissing));
+        octokit = getOctokit(token);
     }
-    if (!bridge) {
-        info('Bridge artifact not found and fail_on_missing=false; exiting without outputs.');
-        setOutput('outputs-json', JSON.stringify({}));
-        setOutput('meta-json', JSON.stringify({}));
-        setOutput('event-json', JSON.stringify({}));
-        return;
+    const upstream = await resolveUpstreamRun(octokit, repository, runId || undefined);
+    const producerTrust = upstream ? classifyProducerTrust(upstream.event) : 'unknown';
+    const runJson = upstream ? runRecord(upstream) : undefined;
+    const setRunOutputs = () => {
+        setOutput('producer-trust', producerTrust);
+        if (runJson)
+            setOutput('run-json', JSON.stringify(runJson));
+    };
+    // Order matters: look the artifact up (GitHub metadata only), then run the checks that need only
+    // GitHub's record of the producer run, and only then download and parse producer-written bytes.
+    let artifactInfo = null;
+    if (!overrideEnabled) {
+        artifactInfo = await logger.withGroup('Bridge Consume: Find Artifact', () => findBridgeArtifact(logger, octokit, repository, runId, artifactName, failOnMissing));
+        if (!artifactInfo) {
+            info('Bridge artifact not found and fail_on_missing=false; exiting without outputs.');
+            setOutput('outputs-json', JSON.stringify({}));
+            setOutput('meta-json', JSON.stringify({}));
+            setOutput('event-json', JSON.stringify({}));
+            if (verify)
+                setOutput('verified-json', JSON.stringify({}));
+            setRunOutputs();
+            return;
+        }
+    }
+    // Whether raw artifact values may be exposed; false only for an untrusted run accepted via verify.
+    const raw = await logger.withGroup('Bridge Consume: Validate Producer Run', () => {
+        if (!upstream) {
+            if (verify) {
+                throw new Error("verify: true needs GitHub's record of the producer run (a workflow_run event or run_id)");
+            }
+            logger.info('No GitHub record of a producer run is available; skipping producer run checks.');
+            return true;
+        }
+        logger.info(`Producer run ${upstream.id}: event=${upstream.event}, trust=${producerTrust}`);
+        const access = validateUpstreamRun(upstream, { sourceWorkflow, requireEvents, untrustedProducerEvents, verify });
+        if (!access.raw) {
+            logger.info('Untrusted producer accepted through verify: exposing only run.* and verified.* values.');
+        }
+        logger.info('Producer run validation passed.');
+        return access.raw;
+    });
+    validateExtractRoots(mappings, { raw, verify });
+    let bridge;
+    if (artifactInfo) {
+        const artifactId = artifactInfo.id;
+        bridge = await logger.withGroup('Bridge Consume: Download Artifact', () => downloadBridgeArtifact(logger, octokit, repository, artifactId));
+    }
+    else {
+        bridge = await logger.withGroup('Bridge Consume: Load Override', () => Promise.resolve(loadOverrideBridge(logger, overrideJson)));
     }
     await logger.withGroup('Bridge Consume: Validate Metadata', () => {
-        validateExpectations(bridge.meta, runId || undefined);
+        validateExpectations(bridge.meta, runId || undefined, upstream);
         logger.info('Metadata validation passed.');
     });
-    if (bridge.filesDir) {
+    let verified;
+    if (verify) {
+        verified = await logger.withGroup('Bridge Consume: Verify', async () => {
+            const result = await verifyProducerRun(octokit, repository, upstream, bridge.meta);
+            const parts = [
+                result.trigger ? `${result.trigger.kind} ${result.trigger.id}` : '',
+                result.pr ? `PR #${result.pr.number}` : ''
+            ].filter(Boolean);
+            logger.info(`Verified ${parts.join(' and ')} against the producer run.`);
+            return result;
+        });
+    }
+    if (raw && bridge.filesDir) {
         await logger.withGroup('Bridge Consume: Restore Files', async () => {
             const restored = await restoreBridgeFiles(bridge.filesDir, destination);
             if (restored) {
@@ -39760,31 +40154,41 @@ async function run() {
             }
         });
     }
-    else if (overrideEnabled) {
+    else if (raw && overrideEnabled) {
         await logger.withGroup('Bridge Consume: Restore Files', () => {
             logger.info('override_json mode does not support bridge/files restore; skipping.');
         });
     }
     await logger.withGroup('Bridge Consume: Expose Outputs', () => {
-        for (const [key, value] of Object.entries(bridge.outputs)) {
-            const outKey = `${prefix}${key}`;
-            const stringValue = value === null ? 'null' : String(value);
-            writeMaybeOutput(outKey, stringValue, expose);
+        if (raw) {
+            for (const [key, value] of Object.entries(bridge.outputs)) {
+                const outKey = `${prefix}${key}`;
+                const stringValue = value === null ? 'null' : String(value);
+                writeMaybeOutput(outKey, stringValue, expose);
+            }
+            logger.info(`Exposed ${Object.keys(bridge.outputs).length} bridge output keys.`);
+            debugJson(logger, 'exposed output keys', Object.keys(bridge.outputs));
         }
-        const extracted = emitExtractedValues(bridge.outputs, bridge.meta, expose);
-        logger.info(`Exposed ${Object.keys(bridge.outputs).length} bridge output keys.`);
+        const roots = raw
+            ? { outputs: bridge.outputs, meta: bridge.meta, event: bridge.meta.event || {} }
+            : { outputs: {}, meta: {}, event: {} };
+        const extracted = emitExtractedValues(mappings, { ...roots, run: runJson ?? {}, verified: verified ?? {} }, expose);
         if (extracted.length > 0) {
             logger.info(`Exposed ${extracted.length} extracted keys from mappings.`);
             debugJson(logger, 'extracted output keys', extracted);
         }
-        debugJson(logger, 'exposed output keys', Object.keys(bridge.outputs));
     });
-    setOutput('outputs-json', JSON.stringify(bridge.outputs));
-    setOutput('meta-json', JSON.stringify(bridge.meta));
-    setOutput('event-json', JSON.stringify(bridge.meta.event || {}));
-    if (bridge.filesDir) {
-        setOutput('files-path', destination);
+    if (raw) {
+        setOutput('outputs-json', JSON.stringify(bridge.outputs));
+        setOutput('meta-json', JSON.stringify(bridge.meta));
+        setOutput('event-json', JSON.stringify(bridge.meta.event || {}));
+        if (bridge.filesDir) {
+            setOutput('files-path', destination);
+        }
     }
+    if (verified)
+        setOutput('verified-json', JSON.stringify(verified));
+    setRunOutputs();
     if (bridge.tempDir) {
         await (0,promises_namespaceObject.rm)(bridge.tempDir, { recursive: true, force: true });
     }

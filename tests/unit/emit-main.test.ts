@@ -35,6 +35,7 @@ const hoisted = vi.hoisted(() => {
       payload: {
         action: 'created',
         sender: { login: 'alice', type: 'User' },
+        comment: { id: 11, body: 'hello', user: { login: 'alice' }, node_id: 'IC_x' },
         pull_request: {
           number: 7,
           head: { sha: 'abc123', ref: 'feature', repo: { full_name: 'fork/repo' } },
@@ -124,6 +125,15 @@ describe('emit action entrypoint', () => {
     const metaJson = hoisted.state.outputs.find((output) => output.name === 'meta-json')?.value;
     const meta = JSON.parse(metaJson ?? '{}') as Record<string, unknown>;
     expect(meta.event).toEqual(hoisted.github.context.payload);
+  });
+
+  it('includes comment and review ids in include_event=minimal', async () => {
+    const { run } = await import('../../src/emit/main.js');
+    await run();
+
+    const metaJson = hoisted.state.outputs.find((output) => output.name === 'meta-json')?.value;
+    const meta = JSON.parse(metaJson ?? '{}') as { event?: Record<string, unknown> };
+    expect(meta.event?.comment).toEqual({ id: 11, body: 'hello', user: { login: 'alice' } });
   });
 
   it('honors explicit event_fields selection over include_event mode', async () => {
