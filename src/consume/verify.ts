@@ -39,6 +39,13 @@ export interface VerifiedTrigger {
   updated_at: string;
   path?: string;
   state?: string;
+  /**
+   * Reviews: the commit the review was submitted on. Review comments: the commit the comment now
+   * applies to, which GitHub moves forward as the PR is pushed to.
+   */
+  commit_id?: string;
+  /** Review comments: the commit the comment was made on. */
+  original_commit_id?: string;
 }
 
 export interface Verified {
@@ -128,7 +135,16 @@ function trigger(
   kind: VerifiedTrigger['kind'],
   id: number,
   user: ApiUser,
-  fields: { body?: string | null; url: string; created_at: string; updated_at: string; path?: string; state?: string }
+  fields: {
+    body?: string | null;
+    url: string;
+    created_at: string;
+    updated_at: string;
+    path?: string;
+    state?: string;
+    commit_id?: string | null;
+    original_commit_id?: string;
+  }
 ): VerifiedTrigger {
   return {
     kind,
@@ -140,7 +156,9 @@ function trigger(
     created_at: fields.created_at,
     updated_at: fields.updated_at,
     ...(fields.path !== undefined ? { path: fields.path } : {}),
-    ...(fields.state !== undefined ? { state: fields.state } : {})
+    ...(fields.state !== undefined ? { state: fields.state } : {}),
+    ...(fields.commit_id ? { commit_id: fields.commit_id } : {}),
+    ...(fields.original_commit_id ? { original_commit_id: fields.original_commit_id } : {})
   };
 }
 
@@ -221,7 +239,8 @@ export async function verifyProducerRun(
           url: data.html_url,
           created_at: data.submitted_at,
           updated_at: data.submitted_at,
-          state: data.state
+          state: data.state,
+          commit_id: data.commit_id
         }),
         pr: await fetchPullRequest(octokit, owner, repo, number)
       };
@@ -239,7 +258,9 @@ export async function verifyProducerRun(
           url: data.html_url,
           created_at: data.created_at,
           updated_at: data.updated_at,
-          path: data.path
+          path: data.path,
+          commit_id: data.commit_id,
+          original_commit_id: data.original_commit_id
         }),
         pr: await fetchPullRequest(octokit, owner, repo, number)
       };

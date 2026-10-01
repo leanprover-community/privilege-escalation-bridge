@@ -38,7 +38,20 @@ An `untrusted` run is accepted in one of two ways:
 
 Otherwise `consume` fails, with a message saying what may be forged for that event.
 
-`trusted-workflow` means only the workflow file is trusted, not the job's inputs. If the producer job runs pull request code before `emit`, for example an `issue_comment` workflow that builds the PR, that code can tamper with the later steps of the same job, including `emit` itself. The whole artifact can then be forged. Run pull request code in a separate job from `emit`, and pass its results across as data.
+`trusted-workflow` means only the workflow file is trusted, not the job's inputs. If the producer job runs pull request code before `emit`, for example an `issue_comment` workflow that builds the PR, that code can tamper with the later steps of the same job, including `emit` itself. The whole artifact can then be forged. Run pull request code in a separate job from `emit`, and pass its results across as data. That job still shares the run's artifacts, so the pattern also relies on job order and on `consume`'s artifact check; see [Which artifact is used](#which-artifact-is-used).
+
+### Which artifact is used
+
+Artifact names are unique only within a run attempt, so after a re-run a producer run can hold several artifacts with the bridge's name. `consume` counts only the artifacts named `artifact` that were created at or after the attempt started (`run_started_at`, which each re-run resets), and requires exactly one:
+- The attempt is the triggering `workflow_run`'s attempt. When `run_id` names another run, it is that run's latest attempt, as `GET /actions/runs/{run_id}` reports it.
+- "Re-run all jobs" works, because only the new attempt's artifact counts.
+- If only an earlier attempt uploaded the artifact, for example after "Re-run failed jobs" didn't re-run the job that runs `emit`, `consume` fails.
+- If the attempt uploaded more than one, `consume` fails. `emit` uploads once per attempt, and a second upload under the same name in one attempt fails, so a duplicate means another job uploaded under the bridge's name.
+- Both failures happen even with `fail_on_missing: false`, and before anything is downloaded.
+
+Every job of the producer run shares the run's artifacts, not only the job that runs `emit`. A job that runs pull request code can upload under the bridge's name, and while it runs it can also replace or delete the run's artifacts, as `actions/upload-artifact`'s `overwrite` option does. So when the producer runs pull request code in a separate job:
+- Make the job that runs `emit` need (`needs:`) every job that runs pull request code, and run no pull request code after it. An upload under the bridge's name from an earlier job then makes `emit`'s own upload fail.
+- Run the consumer only for a successful producer run (`if: github.event.workflow_run.conclusion == 'success'`). A run whose `emit` failed that way holds exactly one artifact with the name, and it isn't `emit`'s.
 
 ### Producer events
 
@@ -95,6 +108,9 @@ With `verify: true`, `consume` re-fetches what the consumer acts on from the Git
 Verified values, as the `verified.*` extract root and the `verified-json` output:
 - `verified.pr`: `number`, `title`, `url`, `author`, `state`, `merged`, `head_sha` (the PR's current head), `head_ref`, `head_repo`, `is_fork`, `base_ref`.
 - `verified.trigger` (comment and review events): `kind` (`issue_comment`, `review` or `review_comment`), `id`, `author`, `author_type` (`User` or `Bot`), `body` (the text when `consume` fetched it, including later edits), `url`, `created_at`, `updated_at`, `path` (review comments) and `state` (reviews).
+  - `commit_id` (reviews and review comments): for a review, the commit it was submitted on. For a review comment, the commit it now applies to, which GitHub moves forward as the PR is pushed to.
+  - `original_commit_id` (review comments): the commit the comment was made on. Use it to act on exactly the code the commenter saw.
+  - `verify` doesn't check either commit. They can differ from `run.head_sha` and `verified.pr.head_sha`.
 
 `verify` needs `pull-requests: read`, plus `issues: read` for issue comments. It needs the IDs in the artifact: `include_event: minimal` in `emit` v2 includes them, and with `event_fields`, list `comment.id` and `review.id`. Other producer events are not supported and fail with `verify: true`.
 
@@ -233,7 +249,7 @@ Path: `consume/action.yml`
   - Caller `env` values are not automatically inherited by reusable workflows.
   - Must allow `actions:read` in the target repository.
 - `artifact` (default: `bridge`)
-  - Artifact name to download from the producer run.
+  - Artifact name to download from the producer run. Exactly one artifact with this name must have been uploaded during the producer run's attempt; see [Which artifact is used](#which-artifact-is-used).
 - `override_json`
   - Optional JSON object with canonical bridge payload fields `meta` and `outputs`.
   - When non-empty, `consume` skips artifact download and uses this payload instead. It resolves a token only when `verify: true`.
@@ -241,7 +257,7 @@ Path: `consume/action.yml`
   - `bridge/files` restore is not supported in this mode, so `files-path` is not emitted.
 - `run_id` (defaults to triggering `workflow_run.id`)
   - Required unless the action is running under a `workflow_run` event.
-  - When it names a run other than the triggering one, `consume` reads GitHub's record of that run from the REST API (`GET /repos/{repo}/actions/runs/{run_id}`, covered by `actions:read`). The run attempt is then not checked.
+  - When it names a run other than the triggering one, `consume` reads GitHub's record of that run from the REST API (`GET /repos/{repo}/actions/runs/{run_id}`, covered by `actions:read`). The attempt is then that run's latest attempt: only its artifact counts, and `meta.workflow_run_attempt` is not checked.
   - In `override_json` mode, this binding is only checked when a run id is available from input or event context.
 - `source_workflow`
   - Optional exact match against the producer run's workflow name in GitHub's record (`workflow_run.name`).
@@ -262,6 +278,7 @@ Path: `consume/action.yml`
 - `fail_on_missing` (default: `true`)
   - `true`: missing artifact fails the action.
   - `false`: missing artifact does not fail; JSON outputs are emitted as `{}` and no per-key outputs are emitted.
+  - An artifact uploaded only by an earlier attempt, or more than one uploaded by this attempt, still fails (see [Which artifact is used](#which-artifact-is-used)).
 - `expose` (`outputs`, `env`, `both`; default `outputs`)
   - Controls where per-key bridge outputs and extracted mappings are written.
   - `outputs`: step outputs only.
@@ -303,7 +320,7 @@ When `fail_on_missing=false` and the artifact is not found, `outputs-json` is `{
 
 1. Check the configuration: `untrusted_producer_events` entries, and the `extract` roots.
 2. Read GitHub's record of the producer run: the `workflow_run` payload, or the REST API for another `run_id`.
-3. Look up the artifact by name. This reads only GitHub's artifact metadata. If the artifact is missing, fail, or exit with empty outputs when `fail_on_missing=false`.
+3. Look up the artifact by name. This reads only GitHub's artifact metadata. Only artifacts created since the producer run's attempt started count, and there must be exactly one (see [Which artifact is used](#which-artifact-is-used)). If the run has no artifact with the name, fail, or exit with empty outputs when `fail_on_missing=false`.
 4. Check the producer run:
    - `source_workflow` -> `workflow_run.name`
    - `require_event` -> `workflow_run.event` membership
@@ -420,6 +437,12 @@ The producer only has to run on the events and emit `include_event: minimal`. Th
           PR_NUMBER: ${{ steps.bridge.outputs.pr_number }}
         run: ./handle-command.sh
 ```
+
+## Changes in v2.1
+
+- `consume` uses only the artifact uploaded during the producer run's attempt. It fails when that attempt uploaded more than one artifact with the name, or when only an earlier attempt uploaded one, even with `fail_on_missing: false`. See [Which artifact is used](#which-artifact-is-used).
+- When `run_id` names another run, only that run's latest attempt counts. v2.0 accepted an artifact from any attempt in that mode.
+- `verified.trigger` has `commit_id` for reviews, and `commit_id` and `original_commit_id` for review comments.
 
 ## Upgrading from v1
 

@@ -127529,6 +127529,36 @@ function validateExtractRoots(mappings, access) {
         }
     }
 }
+/**
+ * Picks the bridge artifact of the producer run's attempt. Artifact names are unique only within an
+ * attempt, so a run can hold several artifacts with the bridge's name: only those created at or after
+ * the attempt started count, and there must be at most one. Returns undefined when the run has none
+ * at all, and fails when only earlier attempts uploaded one, since that is a rejection, not a
+ * missing artifact.
+ */
+function selectAttemptArtifact(artifacts, name, run) {
+    const startedAt = Date.parse(run.attemptStartedAt ?? '');
+    if (Number.isNaN(startedAt)) {
+        throw new Error(`GitHub's record of run ${run.id} has no attempt start time (run_started_at)`);
+    }
+    const attempt = run.runAttempt ? `attempt ${run.runAttempt} of run ${run.id}` : `the latest attempt of run ${run.id}`;
+    const named = artifacts.filter((artifact) => artifact.name === name);
+    const current = named.filter((artifact) => {
+        if (!artifact.created_at) {
+            throw new Error(`Artifact '${name}' (id=${artifact.id}) has no creation time, so it cannot be tied to ${attempt}`);
+        }
+        return Date.parse(artifact.created_at) >= startedAt;
+    });
+    if (current.length > 1) {
+        throw new Error(`Found ${current.length} artifacts named '${name}' uploaded during ${attempt}, expected one. emit uploads ` +
+            'once per attempt, so another job of the producer run uploaded under the same name.');
+    }
+    if (current.length === 0 && named.length > 0) {
+        throw new Error(`Artifact '${name}' was uploaded only by an earlier attempt of run ${run.id}, not by ${attempt}. ` +
+            "A re-run must also re-run the job that runs emit, for example with 'Re-run all jobs'.");
+    }
+    return current[0];
+}
 /** The run.* extract root: GitHub's record of the producer run. */
 function runRecord(run) {
     const record = { id: run.id, event: run.event, workflow: run.workflowName };

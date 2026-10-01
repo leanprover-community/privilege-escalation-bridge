@@ -39497,6 +39497,36 @@ function validateExtractRoots(mappings, access) {
         }
     }
 }
+/**
+ * Picks the bridge artifact of the producer run's attempt. Artifact names are unique only within an
+ * attempt, so a run can hold several artifacts with the bridge's name: only those created at or after
+ * the attempt started count, and there must be at most one. Returns undefined when the run has none
+ * at all, and fails when only earlier attempts uploaded one, since that is a rejection, not a
+ * missing artifact.
+ */
+function selectAttemptArtifact(artifacts, name, run) {
+    const startedAt = Date.parse(run.attemptStartedAt ?? '');
+    if (Number.isNaN(startedAt)) {
+        throw new Error(`GitHub's record of run ${run.id} has no attempt start time (run_started_at)`);
+    }
+    const attempt = run.runAttempt ? `attempt ${run.runAttempt} of run ${run.id}` : `the latest attempt of run ${run.id}`;
+    const named = artifacts.filter((artifact) => artifact.name === name);
+    const current = named.filter((artifact) => {
+        if (!artifact.created_at) {
+            throw new Error(`Artifact '${name}' (id=${artifact.id}) has no creation time, so it cannot be tied to ${attempt}`);
+        }
+        return Date.parse(artifact.created_at) >= startedAt;
+    });
+    if (current.length > 1) {
+        throw new Error(`Found ${current.length} artifacts named '${name}' uploaded during ${attempt}, expected one. emit uploads ` +
+            'once per attempt, so another job of the producer run uploaded under the same name.');
+    }
+    if (current.length === 0 && named.length > 0) {
+        throw new Error(`Artifact '${name}' was uploaded only by an earlier attempt of run ${run.id}, not by ${attempt}. ` +
+            "A re-run must also re-run the job that runs emit, for example with 'Re-run all jobs'.");
+    }
+    return current[0];
+}
 /** The run.* extract root: GitHub's record of the producer run. */
 function runRecord(run) {
     const record = { id: run.id, event: run.event, workflow: run.workflowName };
@@ -39769,7 +39799,9 @@ function trigger(kind, id, user, fields) {
         created_at: fields.created_at,
         updated_at: fields.updated_at,
         ...(fields.path !== undefined ? { path: fields.path } : {}),
-        ...(fields.state !== undefined ? { state: fields.state } : {})
+        ...(fields.state !== undefined ? { state: fields.state } : {}),
+        ...(fields.commit_id ? { commit_id: fields.commit_id } : {}),
+        ...(fields.original_commit_id ? { original_commit_id: fields.original_commit_id } : {})
     };
 }
 /**
@@ -39844,7 +39876,8 @@ async function verifyProducerRun(octokit, repository, run, meta) {
                     url: data.html_url,
                     created_at: data.submitted_at,
                     updated_at: data.submitted_at,
-                    state: data.state
+                    state: data.state,
+                    commit_id: data.commit_id
                 }),
                 pr: await fetchPullRequest(octokit, owner, repo, number)
             };
@@ -39862,7 +39895,9 @@ async function verifyProducerRun(octokit, repository, run, meta) {
                     url: data.html_url,
                     created_at: data.created_at,
                     updated_at: data.updated_at,
-                    path: data.path
+                    path: data.path,
+                    commit_id: data.commit_id,
+                    original_commit_id: data.original_commit_id
                 }),
                 pr: await fetchPullRequest(octokit, owner, repo, number)
             };
@@ -39914,7 +39949,8 @@ function toUpstreamRun(record, fromPayload) {
         actor: record.actor?.login,
         headSha: record.head_sha,
         headBranch: record.head_branch ?? undefined,
-        createdAt: record.created_at
+        createdAt: record.created_at,
+        attemptStartedAt: record.run_started_at
     };
 }
 // GitHub's record of the producer run: the triggering workflow_run payload when it describes runId,
@@ -39932,26 +39968,26 @@ async function resolveUpstreamRun(octokit, repository, runId) {
     const { data } = await octokit.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
     return toUpstreamRun(data, false);
 }
-async function findBridgeArtifact(logger, octokit, repository, runId, artifactName, failOnMissing) {
+async function findBridgeArtifact(logger, octokit, repository, upstream, artifactName, failOnMissing) {
     const [owner, repo] = repository.split('/');
-    const artifactsResp = await octokit.rest.actions.listWorkflowRunArtifacts({
+    const artifacts = await octokit.paginate(octokit.rest.actions.listWorkflowRunArtifacts, {
         owner,
         repo,
-        run_id: runId,
+        run_id: Number(upstream.id),
         name: artifactName,
         per_page: 100
     });
-    logger.info(`Found ${artifactsResp.data.artifacts.length} artifact(s) named '${artifactName}' on source run.`);
-    debugJson(logger, 'source artifacts', artifactsResp.data.artifacts.map((a) => ({ id: a.id, name: a.name, size_in_bytes: a.size_in_bytes })));
-    const artifactInfo = artifactsResp.data.artifacts.find((a) => a.name === artifactName);
+    logger.info(`Found ${artifacts.length} artifact(s) named '${artifactName}' on source run.`);
+    debugJson(logger, 'source artifacts', artifacts.map((a) => ({ id: a.id, name: a.name, size_in_bytes: a.size_in_bytes, created_at: a.created_at })));
+    const artifactInfo = selectAttemptArtifact(artifacts, artifactName, upstream);
     if (!artifactInfo) {
         if (failOnMissing) {
-            throw new Error(`Artifact ${artifactName} was not found for run ${runId}`);
+            throw new Error(`Artifact ${artifactName} was not found for run ${upstream.id}`);
         }
         logger.warning(`Artifact '${artifactName}' not found; continuing because fail_on_missing=false.`);
         return null;
     }
-    logger.info(`Selected artifact '${artifactInfo.name}' (id=${artifactInfo.id}).`);
+    logger.info(`Selected artifact '${artifactInfo.name}' (id=${artifactInfo.id}), uploaded during the producer run's attempt.`);
     return { id: artifactInfo.id, name: artifactInfo.name };
 }
 async function downloadBridgeArtifact(logger, octokit, repository, artifactId) {
@@ -40085,11 +40121,16 @@ async function run() {
         if (runJson)
             setOutput('run-json', JSON.stringify(runJson));
     };
-    // Order matters: look the artifact up (GitHub metadata only), then run the checks that need only
-    // GitHub's record of the producer run, and only then download and parse producer-written bytes.
+    // Order matters: pick the artifact of the producer run's attempt (GitHub metadata only), then run
+    // the checks that need only GitHub's record of the producer run, and only then download and parse
+    // producer-written bytes.
     let artifactInfo = null;
     if (!overrideEnabled) {
-        artifactInfo = await logger.withGroup('Bridge Consume: Find Artifact', () => findBridgeArtifact(logger, octokit, repository, runId, artifactName, failOnMissing));
+        // Artifact mode always has a token and a run id, so this holds unless GitHub returned no record.
+        if (!upstream)
+            throw new Error(`GitHub's record of run ${runId} is not available`);
+        const producerRun = upstream;
+        artifactInfo = await logger.withGroup('Bridge Consume: Find Artifact', () => findBridgeArtifact(logger, octokit, repository, producerRun, artifactName, failOnMissing));
         if (!artifactInfo) {
             info('Bridge artifact not found and fail_on_missing=false; exiting without outputs.');
             setOutput('outputs-json', JSON.stringify({}));

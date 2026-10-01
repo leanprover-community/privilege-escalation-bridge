@@ -13,7 +13,7 @@ const hoisted = vi.hoisted(() => {
     env: [] as Array<{ name: string; value: string }>,
     infos: [] as string[],
     failed: [] as string[],
-    artifacts: [] as Array<{ id: number; name: string; size_in_bytes: number }>,
+    artifacts: [] as Array<{ id: number; name: string; size_in_bytes: number; created_at: string | null }>,
     zipData: null as Buffer | null,
     repository: 'owner/repo',
     workflowRunId: 123,
@@ -55,6 +55,10 @@ const hoisted = vi.hoisted(() => {
   };
 
   const octokit = {
+    // The artifact listing is paginated; the fake API returns everything on one page.
+    paginate: vi.fn(async (method: (params: unknown) => Promise<{ data: { artifacts: unknown[] } }>, params: unknown) =>
+      (await method(params)).data.artifacts
+    ),
     rest: {
       pulls: {
         get: vi.fn(async ({ pull_number }: { pull_number: number }) => found(state.pulls[pull_number])),
@@ -95,6 +99,9 @@ vi.mock('@actions/core', () => hoisted.core);
 vi.mock('@actions/github', () => hoisted.github);
 
 const BASE_REPO_ID = 1;
+// A first attempt starts when the run is created; a re-run resets run_started_at.
+const RUN_CREATED = '2026-09-28T12:00:10Z';
+const DURING_ATTEMPT = '2026-09-28T12:00:30Z';
 
 function workflowRunRecord(overrides?: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -105,7 +112,8 @@ function workflowRunRecord(overrides?: Record<string, unknown>): Record<string, 
     actor: { login: 'alice' },
     head_sha: 'head1',
     head_branch: 'feature',
-    created_at: '2026-09-28T12:00:10Z',
+    created_at: RUN_CREATED,
+    run_started_at: RUN_CREATED,
     repository: { id: BASE_REPO_ID },
     head_repository: { id: BASE_REPO_ID },
     ...overrides
@@ -158,7 +166,7 @@ describe('consume action entrypoint', () => {
     hoisted.state.env = [];
     hoisted.state.infos = [];
     hoisted.state.failed = [];
-    hoisted.state.artifacts = [{ id: 1, name: 'bridge', size_in_bytes: 123 }];
+    hoisted.state.artifacts = [{ id: 1, name: 'bridge', size_in_bytes: 123, created_at: DURING_ATTEMPT }];
     hoisted.state.zipData = createBridgeZip();
     hoisted.state.workflowRun = workflowRunRecord();
     hoisted.state.apiWorkflowRun = {};
@@ -487,5 +495,92 @@ describe('consume action entrypoint', () => {
 
     const runJson = hoisted.state.outputs.find((o) => o.name === 'run-json')?.value;
     expect(JSON.parse(runJson ?? '{}')).toMatchObject({ id: '123', event: 'issue_comment', actor: 'alice' });
+  });
+
+  describe('artifact of the producer run attempt', () => {
+    const RERUN_STARTED = '2026-09-28T13:00:00Z';
+
+    beforeEach(() => {
+      // Attempt 2: run_started_at is reset, created_at is still the run's.
+      hoisted.state.workflowRunAttempt = 2;
+      hoisted.state.workflowRun = workflowRunRecord({ run_started_at: RERUN_STARTED });
+      hoisted.state.zipData = createBridgeZip();
+    });
+
+    afterEach(() => {
+      hoisted.state.workflowRunAttempt = 1;
+    });
+
+    it('uses only the artifact uploaded during the triggering attempt after a re-run', async () => {
+      hoisted.state.artifacts = [
+        { id: 1, name: 'bridge', size_in_bytes: 1, created_at: DURING_ATTEMPT },
+        { id: 2, name: 'bridge', size_in_bytes: 1, created_at: '2026-09-28T13:00:20Z' }
+      ];
+
+      const { run } = await import('../../src/consume/main.js');
+      await run();
+
+      expect(hoisted.octokit.paginate).toHaveBeenCalledWith(
+        hoisted.octokit.rest.actions.listWorkflowRunArtifacts,
+        expect.objectContaining({ run_id: hoisted.state.workflowRunId, name: 'bridge', per_page: 100 })
+      );
+      expect(hoisted.octokit.rest.actions.downloadArtifact).toHaveBeenCalledWith(
+        expect.objectContaining({ artifact_id: 2 })
+      );
+      expect(hoisted.state.outputs).toContainEqual({ name: 'answer', value: '42' });
+    });
+
+    it('counts an artifact created in the second the attempt started', async () => {
+      hoisted.state.artifacts = [{ id: 2, name: 'bridge', size_in_bytes: 1, created_at: RERUN_STARTED }];
+
+      const { run } = await import('../../src/consume/main.js');
+      await run();
+
+      expect(hoisted.octokit.rest.actions.downloadArtifact).toHaveBeenCalledWith(
+        expect.objectContaining({ artifact_id: 2 })
+      );
+    });
+
+    it('fails on two artifacts with the name in one attempt, even with fail_on_missing=false', async () => {
+      hoisted.state.booleans.fail_on_missing = false;
+      hoisted.state.artifacts = [
+        { id: 2, name: 'bridge', size_in_bytes: 1, created_at: '2026-09-28T13:00:20Z' },
+        { id: 3, name: 'bridge', size_in_bytes: 1, created_at: '2026-09-28T13:00:40Z' }
+      ];
+
+      const { run } = await import('../../src/consume/main.js');
+      await expect(run()).rejects.toThrow(
+        /Found 2 artifacts named 'bridge' uploaded during attempt 2 of run 123, expected one/
+      );
+      expect(hoisted.octokit.rest.actions.downloadArtifact).not.toHaveBeenCalled();
+    });
+
+    it('fails when only an earlier attempt uploaded the artifact, even with fail_on_missing=false', async () => {
+      // "Re-run failed jobs" that did not re-run the job running emit.
+      hoisted.state.booleans.fail_on_missing = false;
+      hoisted.state.artifacts = [{ id: 1, name: 'bridge', size_in_bytes: 1, created_at: DURING_ATTEMPT }];
+
+      const { run } = await import('../../src/consume/main.js');
+      await expect(run()).rejects.toThrow(
+        /Artifact 'bridge' was uploaded only by an earlier attempt of run 123, not by attempt 2 of run 123\. A re-run must also re-run the job that runs emit/
+      );
+      expect(hoisted.octokit.rest.actions.downloadArtifact).not.toHaveBeenCalled();
+    });
+
+    it("uses the latest attempt's start when run_id names another run", async () => {
+      hoisted.state.workflowRun = undefined;
+      hoisted.state.apiWorkflowRun = workflowRunRecord({ run_attempt: 2, run_started_at: RERUN_STARTED });
+      hoisted.state.artifacts = [
+        { id: 1, name: 'bridge', size_in_bytes: 1, created_at: DURING_ATTEMPT },
+        { id: 2, name: 'bridge', size_in_bytes: 1, created_at: '2026-09-28T13:00:20Z' }
+      ];
+
+      const { run } = await import('../../src/consume/main.js');
+      await run();
+
+      expect(hoisted.octokit.rest.actions.downloadArtifact).toHaveBeenCalledWith(
+        expect.objectContaining({ artifact_id: 2 })
+      );
+    });
   });
 });

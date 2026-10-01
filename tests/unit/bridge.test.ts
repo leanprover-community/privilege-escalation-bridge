@@ -13,6 +13,7 @@ import {
   pickByPaths,
   restoreBridgeFiles,
   runRecord,
+  selectAttemptArtifact,
   validateConsumerExpectations,
   validateExtractRoots,
   validateUpstreamRun,
@@ -526,5 +527,40 @@ describe('producer trust', () => {
     expect(() =>
       validateConsumerExpectations(meta, { ...base, upstream: upstreamRun({ workflowName: 'Other' }) })
     ).toThrow(/Workflow mismatch/);
+  });
+});
+
+describe('selectAttemptArtifact', () => {
+  const run = upstreamRun({ attemptStartedAt: '2026-09-28T12:00:00Z' });
+  const artifact = (id: number, createdAt: string | null, name = 'bridge') => ({ id, name, created_at: createdAt });
+
+  it('selects the one artifact with the name created since the attempt started', () => {
+    const artifacts = [
+      artifact(1, '2026-09-28T11:00:00Z'),
+      artifact(2, '2026-09-28T12:00:00Z'),
+      artifact(3, '2026-09-28T12:00:05Z', 'bridge-other')
+    ];
+    expect(selectAttemptArtifact(artifacts, 'bridge', run)?.id).toBe(2);
+  });
+
+  it('returns undefined when the run has no artifact with the name', () => {
+    expect(selectAttemptArtifact([artifact(3, '2026-09-28T12:00:05Z', 'other')], 'bridge', run)).toBeUndefined();
+  });
+
+  it('fails on duplicates in the attempt, or when only an earlier attempt uploaded one', () => {
+    expect(() =>
+      selectAttemptArtifact([artifact(1, '2026-09-28T12:00:01Z'), artifact(2, '2026-09-28T12:00:02Z')], 'bridge', run)
+    ).toThrow(/Found 2 artifacts named 'bridge' uploaded during attempt 1 of run 123, expected one/);
+    expect(() => selectAttemptArtifact([artifact(1, '2026-09-28T11:59:59Z')], 'bridge', run)).toThrow(
+      /uploaded only by an earlier attempt of run 123, not by attempt 1 of run 123/
+    );
+    expect(() =>
+      selectAttemptArtifact([artifact(1, '2026-09-28T11:59:59Z')], 'bridge', { ...run, runAttempt: undefined })
+    ).toThrow(/not by the latest attempt of run 123/);
+  });
+
+  it('fails closed without the times it compares', () => {
+    expect(() => selectAttemptArtifact([artifact(1, null)], 'bridge', run)).toThrow(/has no creation time/);
+    expect(() => selectAttemptArtifact([], 'bridge', upstreamRun())).toThrow(/has no attempt start time \(run_started_at\)/);
   });
 });
